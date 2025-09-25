@@ -1,0 +1,12 @@
+FastAPI
+uvicorn
+pydantic
+scikit-learn
+numpy
+pandas
+yara-python
+requests
+beautifulsoup4
+httpx
+transformers
+torch
