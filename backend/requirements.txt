@@ -1,12 +1,8 @@
-FastAPI
+fastapi
 uvicorn
 pydantic
-scikit-learn
-numpy
-pandas
-yara-python
+google-generativeai
+python-dotenv
 requests
-beautifulsoup4
-httpx
-transformers
-torch
+numpy
+python-multipart

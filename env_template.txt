@@ -1,0 +1,39 @@
+# CyAi Dashboard Environment Configuration
+# Copy this file to .env and update the values
+
+# Gemini API Configuration
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Backend Configuration
+BACKEND_HOST=0.0.0.0
+BACKEND_PORT=8000
+DEBUG=True
+LOG_LEVEL=INFO
+
+# Model Configuration
+MAX_FILE_SIZE=50MB
+MAX_BATCH_SIZE=100
+MODEL_CACHE_SIZE=10
+
+# Security Configuration
+CORS_ORIGINS=*
+SECRET_KEY=your_secret_key_here
+API_RATE_LIMIT=100
+
+# Database Configuration (if needed in future)
+# DATABASE_URL=sqlite:///./cyai_dashboard.db
+
+# Logging Configuration
+LOG_FILE=logs/cyai_dashboard.log
+LOG_ROTATION=daily
+LOG_RETENTION=30
+
+# Performance Configuration
+WORKER_PROCESSES=4
+MAX_CONNECTIONS=1000
+TIMEOUT=30
+
+# Monitoring Configuration
+ENABLE_METRICS=True
+METRICS_PORT=9090
+HEALTH_CHECK_INTERVAL=60
