@@ -1,40 +1,20 @@
-# CyAi Dashboard - Production Requirements
-# Backend Dependencies
-FastAPI==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
-python-multipart==0.0.6
-python-dotenv==1.0.0
-
-# AI and ML Dependencies
-google-generativeai==0.3.2
-scikit-learn==1.3.2
-numpy==1.24.3
-pandas==2.1.4
-transformers==4.36.2
-torch==2.1.2
-
-# File Processing
-python-magic==0.4.27
-python-magic-bin==0.4.14
-
-# HTTP and Web
-requests==2.31.0
-httpx==0.25.2
-beautifulsoup4==4.12.2
-
-# Security and Analysis
-yara-python==4.3.1
-
-# Frontend Dependencies
-streamlit==1.28.2
-plotly==5.17.0
-
-# Development and Testing
-pytest==7.4.3
-pytest-asyncio==0.21.1
-black==23.11.0
-flake8==6.1.0
-
-# Production
-gunicorn==21.2.0
+fastapi==0.115.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+requests==2.32.3
+python-dotenv==1.0.1
+tensorflow==2.20.0
+numpy
+pandas==2.2.3
+# scikit-learn==1.5.2
+keras==3.4.1
+tokenizers==0.19.1
+google-generativeai==0.8.3
+streamlit==1.38.0
+plotly==5.24.1
+matplotlib==3.9.2
+seaborn==0.13.2
+joblib==1.4.2
+tqdm==4.66.5
+python-multipart==0.0.9
+# yara-python==4.5.2

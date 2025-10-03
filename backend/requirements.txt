@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-pydantic
-google-generativeai
-python-dotenv
-requests
-numpy
-python-multipart
