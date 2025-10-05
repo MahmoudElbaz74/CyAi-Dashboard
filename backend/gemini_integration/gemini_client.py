@@ -92,6 +92,122 @@ class GeminiClient:
 		except Exception as e:
 			logger.error(f"Error getting Gemini explanation: {e}")
 			return self._get_fallback_explanation(classification, confidence)
+
+	async def get_final_url_verdict(
+		self,
+		*,
+		url: str,
+		model_result: Dict[str, Any],
+		vt_result: Dict[str, Any]
+	) -> Dict[str, Any]:
+		"""Compute final URL verdict by combining model + VirusTotal using Gemini.
+
+		Returns JSON with keys: final_label, threat_level, explanation, notes.
+		"""
+		try:
+			prompt = self._build_final_verdict_prompt(url, model_result, vt_result)
+			response = await self._generate_response(prompt)
+			return self._parse_final_verdict_response(response, model_result, vt_result)
+		except Exception as e:
+			logger.error(f"Error getting final URL verdict from Gemini: {e}")
+			return self._fallback_final_verdict(model_result, vt_result)
+
+	def _build_final_verdict_prompt(self, url: str, model_result: Dict[str, Any], vt_result: Dict[str, Any]) -> str:
+		"""Builds the decision prompt with explicit decision rules and required JSON fields."""
+		from urllib.parse import urlparse
+		domain = urlparse(url).netloc
+		local_pred = float(model_result.get("score", 0.5))
+		local_label = model_result.get("label", "Suspicious")
+		prompt = f"""
+You are a senior cybersecurity threat analyst. Your job is to make the **final phishing verdict** based on the following three sources of evidence:
+
+1️⃣ Local AI Model Output:
+- Classification: {local_label}
+- Risk Score: {local_pred:.2f}
+
+2️⃣ VirusTotal Report:
+{str(vt_result)[:1500]}
+
+3️⃣ URL Information:
+{url}
+
+📊 Your decision rules:
+- If VirusTotal shows **any malicious detections (>=1)** → classify as at least **"Suspicious"**. Do NOT return "Safe".
+- If model and VT both say malicious → **"Malicious"**.
+- If model says safe but VT flags something → **"Suspicious"** (or **"Malicious"** if >5 detections).
+- If model says suspicious/malicious but VirusTotal shows 0 detections AND the domain is a well-known legitimate service (e.g., github.com, google.com, openai.com, microsoft.com, cloudflare.com) → **"Likely False Positive"**.
+- If both say safe and the domain is well-known legitimate → **"Safe"**.
+- If results conflict but there’s **NO strong evidence of malicious behavior** → choose **"Suspicious"** with lower confidence.
+- If you strongly suspect the model is overfitting or hallucinating → choose **"Likely False Positive"**.
+
+Return ONLY a valid JSON object with the following keys:
+- classification: (Safe, Suspicious, Malicious, Likely False Positive)
+- confidence: (0-1 float, how confident you are in the decision)
+- risk_score: (0-1 float overall risk assessment)
+- threat_level: (Low, Medium, High)
+- explanation: A short but clear explanation for why you made this decision.
+- recommended_action: Clear step-by-step instructions on what the security team should do next.
+"""
+		return prompt
+
+	def _parse_final_verdict_response(self, response: str, model_result: Dict[str, Any], vt_result: Dict[str, Any]) -> Dict[str, Any]:
+		"""Parse the final verdict JSON; provide robust fallback if parsing fails."""
+		import json
+		try:
+			parsed = json.loads(response)
+			# Support both our schema and user's classification schema
+			classification = parsed.get("final_label") or parsed.get("classification") or model_result.get("label", "Suspicious")
+			final_label = classification
+			threat_level = parsed.get("threat_level") or self._assess_threat_level(final_label, float(model_result.get("score", 0.5)))
+			explanation = parsed.get("explanation") or "Combined decision based on model and VirusTotal."
+			recommended_action = parsed.get("recommended_action")
+			confidence = parsed.get("confidence")
+			risk_score = parsed.get("risk_score")
+			return {
+				"final_label": final_label,
+				"threat_level": threat_level,
+				"explanation": explanation,
+				"recommended_action": recommended_action,
+				"confidence": confidence,
+				"risk_score": risk_score,
+			}
+		except Exception:
+			return self._fallback_final_verdict(model_result, vt_result, response)
+
+	def _fallback_final_verdict(self, model_result: Dict[str, Any], vt_result: Dict[str, Any], raw: str = "") -> Dict[str, Any]:
+		"""Heuristic fallback when Gemini is unavailable or parsing fails."""
+		model_label = (model_result or {}).get("label", "Suspicious")
+		score = float((model_result or {}).get("score", 0.5))
+		vt_verdict = (vt_result or {}).get("verdict", "Unknown")
+		detections = int((vt_result or {}).get("detections", 0))
+		# Enforce conservative rule: any VT detections >=1 => at least Suspicious
+		if detections >= 1:
+			if detections > 5 or vt_verdict == "Malicious":
+				final_label = "Malicious"
+				threat = "High"
+			else:
+				final_label = "Suspicious"
+				threat = "Medium"
+		elif detections == 0 and model_label in ("Suspicious", "Malicious") and score >= 0.6:
+			# Likely false positive on well-known/clean domains should be handled by LLM; fallback marks as likely FP
+			final_label = "Likely False Positive"
+			threat = "Low"
+		elif vt_verdict in ("Safe", "Unknown") and score < 0.4:
+			final_label = "Safe"
+			threat = "Low"
+		elif vt_verdict in ("Safe", "Unknown") and score >= 0.7:
+			final_label = "Suspicious"
+			threat = "Medium"
+		else:
+			final_label = model_label
+			threat = self._assess_threat_level(model_label, score)
+		expl = "Heuristic final verdict based on model and VirusTotal in fallback mode."
+		notes = []
+		if vt_verdict not in ("Unknown", final_label):
+			notes.append("Model and VirusTotal differ; manual review recommended.")
+		if raw:
+			notes.append("AI response parsing failed; used fallback rules.")
+		return {"final_label": final_label, "threat_level": threat, "explanation": expl, "notes": notes}
 	
 	async def get_threat_intelligence(
 		self,

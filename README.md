@@ -24,7 +24,7 @@ AI-powered cybersecurity analysis platform providing log analysis, URL phishing 
 ## Overview
 CyAi Dashboard enables analysts to:
 - Classify and label logs with AI explanations
-- Detect phishing risks for URLs
+- Detect phishing risks for URLs with a multi-stage pipeline and an AI-driven final verdict
 - Scan uploaded files for malware indicators and families
 - Ask an AI assistant security questions with contextual insights
 
@@ -83,14 +83,15 @@ Root
 - `main.py`: FastAPI app exposing endpoints:
   - `GET /`: API info and feature list
   - `POST /analyze-logs`: Classifies logs via `LogClassifier` and augments results with Gemini explanations
-  - `POST /analyze-url`: Detects phishing via `PhishingDetector` with Gemini explanations
+  - `POST /analyze-url`: Multi-stage URL analysis that combines a local model, VirusTotal, and a Gemini final decision (see “URL Analysis Pipeline”)
   - `POST /analyze-file`: Scans file bytes via `MalwareDetector` with Gemini explanations
   - `POST /ai-assistant`: AI Agent analysis combining user text with optional model outputs/logs
   - `GET /models/status`, `/models/health`, `/models/info`: Model status and info
 - `config.py`: Central configuration using environment variables; parses `MAX_FILE_SIZE` etc.
 - `gemini_integration/gemini_client.py`:
-  - Wraps Gemini-1.5-Pro: `get_explanation`, `get_threat_intelligence`, `get_remediation_steps`
-  - Parses JSON or falls back to structured defaults; requires `GEMINI_API_KEY`
+  - Wraps Gemini-1.5/2.5 models: `get_explanation`, `get_threat_intelligence`, `get_remediation_steps`, and `get_final_url_verdict`
+  - Implements a structured prompt for the final phishing decision with clear decision rules; parses model JSON or returns robust fallbacks
+  - Enforces conservative defaults in fallback mode (e.g., any VirusTotal detections ≥ 1 ⇒ at least Suspicious)
 - `models/model_manager.py`: Singleton manager instantiating:
   - `LogClassifier`, `PhishingDetector`, `MalwareDetector`
   - Provides `get_*` helpers, `health_check`, and `get_all_models_info`
@@ -133,13 +134,65 @@ Sample URLs, malware links, and PCAP references for testing and demos.
 1. User selects a tool in the Streamlit UI (`frontend/app.py`).
 2. Frontend sends a request to the FastAPI backend:
    - Logs → `POST /analyze-logs`
-   - URL → `POST /analyze-url`
+   - URL → `POST /analyze-url` (multi-stage URL pipeline)
    - File → `POST /analyze-file` (multipart)
    - AI chat → `POST /ai-assistant`
 3. Backend uses `ModelManager` to invoke the appropriate model.
-4. Backend optionally calls Gemini via `GeminiClient` to produce explanations and recommendations.
-5. Backend returns structured responses with classification, confidence, threat level, and recommendations.
-6. Frontend renders status indicators, model outputs, and AI explanations.
+4. For URLs, backend fetches VirusTotal reputation and then calls Gemini to make the final decision.
+5. Backend returns structured responses with the Gemini final verdict, model transparency fields, and performance metrics.
+6. Frontend renders a professional report separating Model, VirusTotal, and Gemini Final Verdict sections.
+
+## URL Analysis Pipeline
+
+The URL checker uses a professional, explainable, multi-stage pipeline:
+
+- Stage 1 — Model Analysis (Local):
+  - Validates and normalizes the URL
+  - Preprocesses and infers a risk score using the local `PhishingDetector`
+  - Produces a model label (Safe/Suspicious/Malicious) and a concise reasoning string
+
+- Stage 2 — VirusTotal Reputation:
+  - Submits the URL to VirusTotal with safe timeouts and error handling
+  - Parses detections and summarizes a `verdict` and stats for display
+
+- Stage 3 — Gemini Final Verdict:
+  - Combines the URL, the model’s score/label/reason, and VirusTotal summary
+  - Applies explicit decision rules to yield a final label, threat level, explanation, and recommended action
+  - Conservative defaults are enforced if the AI is unavailable (e.g., any VT detections ≥ 1 ⇒ at least Suspicious)
+
+Returned structure (abbreviated):
+
+```json
+{
+  "classification": "Malicious",          // Gemini final label
+  "threat_level": "High",                // Gemini threat level
+  "confidence": 0.91,                      // Prefer Gemini confidence if provided
+  "risk_score": 0.88,                      // Prefer Gemini risk if provided
+  "explanation": "…",                     // Gemini explanation
+  "recommended_action": "…",              // Gemini action or dynamic fallback
+  "details": {
+    "url": "https://…",
+    "timestamp": "2025-10-05T20:41:06Z",
+    "model": { "score": 0.88, "label": "Malicious", "reason": "…" },
+    "virustotal": { "verdict": "Malicious", "detections": 7, "summary": "…" },
+    "gemini_final": { "final_label": "Malicious", "threat_level": "High", "explanation": "…" },
+    "notes": ["Model and VT agree on malicious"],
+    "performance_metrics": { "total_time": 0.74, "model_load_time": 0.01, "detection_time": 0.22, "gemini_time": 0.51 }
+  }
+}
+```
+
+### Decision Rules (abridged)
+- If VirusTotal shows any malicious detections (≥ 1) ⇒ at least Suspicious; do not return Safe.
+- If both model and VirusTotal say malicious ⇒ Malicious/High.
+- If model says suspicious/malicious but VirusTotal shows 0 detections and the domain is known good ⇒ Likely False Positive.
+- If both indicate safe and domain is well-known ⇒ Safe.
+- If results conflict with no strong evidence of maliciousness ⇒ Suspicious with lower confidence.
+
+### Dynamic Recommended Actions
+- Malicious / High: Immediate investigation required.
+- Suspicious / Moderate: Caution advised. Manual review recommended.
+- Safe / Likely False Positive / Low: No immediate action required.
 
 ## Local Setup and Running
 
@@ -216,6 +269,11 @@ curl -X POST http://localhost:8000/analyze-url \
   -H "Content-Type: application/json" \
   -d '{"url":"https://example.com","include_analysis":true}'
 ```
+
+Response fields of interest:
+- Top-level `classification` and `threat_level` are produced by Gemini.
+- `details.model` and `details.virustotal` expose transparency for the underlying signals.
+- `details.gemini_final` mirrors the final decision for UI rendering.
 
 ### Analyze File (multipart)
 ```bash

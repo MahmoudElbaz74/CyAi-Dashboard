@@ -93,12 +93,14 @@ class URLAnalysisRequest(BaseModel):
     include_analysis: Optional[bool] = True
 
 class URLAnalysisResponse(BaseModel):
+    # Top-level fields now reflect Gemini's final decision
     classification: str
     confidence: float
     threat_level: str
     risk_score: float
     explanation: str
     recommended_action: str
+    # details contains: model, virustotal, gemini_final, notes, timestamp, url, performance_metrics
     details: Dict[str, Any]
 
 class FileAnalysisResponse(BaseModel):
@@ -276,53 +278,104 @@ async def analyze_url(
         detection_time = time.time() - detection_start
         logger.info(f"🎯 [{request_id}] Phishing detection completed in {detection_time:.3f}s - Result: {detection_result.classification}")
         
-        # Get AI explanation
+        # Get Gemini final decision (verdict) using combined sources
         gemini_start = time.time()
         try:
-            explanation_data = await gemini_client.get_explanation(
-                analysis_type="url",
-                classification=detection_result.classification,
-                confidence=detection_result.confidence,
-                raw_data=request.url,
-                analysis_details=detection_result.analysis_details
+            model_section = detection_result.analysis_details.get("model", {})
+            vt_section = detection_result.analysis_details.get("virustotal", {})
+            final_verdict = await gemini_client.get_final_url_verdict(
+                url=request.url,
+                model_result=model_section,
+                vt_result=vt_section,
             )
-            
-            explanation = explanation_data.get("explanation", "No explanation available")
-            recommended_action = explanation_data.get("recommended_action", "Review and investigate")
-            threat_level = explanation_data.get("threat_level", "Low")
-            
             gemini_time = time.time() - gemini_start
-            logger.info(f"🤖 [{request_id}] Gemini explanation completed in {gemini_time:.3f}s")
-            
+            logger.info(f"🤖 [{request_id}] Gemini final verdict completed in {gemini_time:.3f}s")
+
+            # Top-level fields adopt Gemini decision
+            final_label = final_verdict.get("final_label", detection_result.classification)
+            final_threat = final_verdict.get("threat_level", "Low")
+            final_explanation = final_verdict.get("explanation", "")
+            final_confidence = final_verdict.get("confidence")
+            final_risk_score = final_verdict.get("risk_score")
+            notes_merge = list(detection_result.analysis_details.get("notes", [])) + list(final_verdict.get("notes", []))
+
+            # Prefer Gemini-provided recommended action; fallback to dynamic rules
+            recommended_action = final_verdict.get("recommended_action")
+            if not recommended_action:
+                if final_label == "Malicious" and final_threat == "High":
+                    recommended_action = "Immediate investigation required."
+                elif final_label in ("Malicious",) or final_threat in ("High",):
+                    recommended_action = "Immediate investigation required."
+                elif final_label in ("Suspicious", "Likely False Positive") or final_threat in ("Moderate", "Medium"):
+                    recommended_action = "Caution advised. Manual review recommended."
+                else:
+                    recommended_action = "No immediate action required."
+
+            threat_level = final_threat
+            explanation = final_explanation
+            classification = final_label
+            # Prefer Gemini-provided confidence/risk if present
+            if isinstance(final_confidence, (int, float)):
+                detection_result.confidence = float(final_confidence)
+            if isinstance(final_risk_score, (int, float)):
+                detection_result.risk_score = float(final_risk_score)
         except Exception as e:
-            logger.error(f"❌ [{request_id}] Error getting Gemini explanation: {e}")
-            explanation = f"URL classified as {detection_result.classification} with {detection_result.confidence:.2%} confidence. AI explanation unavailable."
-            recommended_action = "Review and investigate as needed"
-            threat_level = "Unknown"
+            logger.error(f"❌ [{request_id}] Error getting Gemini final verdict: {e}")
+            # Fallback: use explanation-only mode
+            try:
+                explanation_data = await gemini_client.get_explanation(
+                    analysis_type="url",
+                    classification=detection_result.classification,
+                    confidence=detection_result.confidence,
+                    raw_data=request.url,
+                    analysis_details=detection_result.analysis_details,
+                )
+                explanation = explanation_data.get("explanation", "No explanation available")
+                recommended_action = explanation_data.get("recommended_action", "Review and investigate")
+                threat_level = explanation_data.get("threat_level", "Low")
+                classification = detection_result.classification
+            except Exception:
+                explanation = f"URL classified as {detection_result.classification} with {detection_result.confidence:.2%} confidence. AI explanation unavailable."
+                recommended_action = "Review and investigate as needed"
+                threat_level = "Unknown"
+                classification = detection_result.classification
             gemini_time = time.time() - gemini_start
             logger.info(f"⚠️ [{request_id}] Using fallback explanation after {gemini_time:.3f}s")
         
         total_time = time.time() - start_time
         logger.info(f"✅ [{request_id}] URL analysis completed successfully in {total_time:.3f}s")
         
+        # Build separated sections for frontend consumption
+        details = detection_result.analysis_details or {}
+        # Record Gemini final verdict for frontend rendering
+        if 'gemini_final' not in details:
+            details['gemini_final'] = {
+                'final_label': classification,
+                'threat_level': threat_level,
+                'explanation': explanation,
+            }
+        else:
+            # If previous set exists, update with latest values
+            details['gemini_final'].update({
+                'final_label': classification,
+                'threat_level': threat_level,
+                'explanation': explanation,
+            })
+        details["performance_metrics"] = {
+            "total_time": round(total_time, 3),
+            "model_load_time": round(model_time, 3),
+            "detection_time": round(detection_time, 3),
+            "gemini_time": round(gemini_time, 3)
+        }
+
         return URLAnalysisResponse(
-            classification=detection_result.classification,
-            confidence=detection_result.confidence,
+            classification=classification,  # Gemini final label
+            confidence=detection_result.confidence,  # retain model confidence for transparency
             threat_level=threat_level,
             risk_score=detection_result.risk_score,
             explanation=explanation,
             recommended_action=recommended_action,
-            details={
-                "analysis_details": detection_result.analysis_details,
-                "recommendations": detection_result.recommendations,
-                "url_analysis": detection_result.analysis_details.get("url_analysis", {}),
-                "performance_metrics": {
-                    "total_time": round(total_time, 3),
-                    "model_load_time": round(model_time, 3),
-                    "detection_time": round(detection_time, 3),
-                    "gemini_time": round(gemini_time, 3)
-                }
-            }
+            details=details,
         )
         
     except Exception as e:

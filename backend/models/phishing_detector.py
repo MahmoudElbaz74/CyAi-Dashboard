@@ -13,6 +13,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from pydantic import BaseModel
+from utils.validation_utils import validate_url  # URL validation and basic sanitization
 # TensorFlow/Keras imports with fallbacks
 try:
     from tensorflow.keras.models import load_model
@@ -104,25 +105,30 @@ class PhishingDetector:
             self.tokenizer = None
 
     def _preprocess_for_model(self, url: str) -> np.ndarray:
-        """تجهيز URL بنفس طريقة التدريب"""
+        """Prepare URL text similar to training: normalize case, scheme, and tokenization.
+
+        Returns a padded sequence; falls back to zeros if tokenizer is unavailable.
+        """
         if self.tokenizer is None:
             logger.error("❌ Tokenizer not loaded")
-            # Return dummy data to prevent crashes
             return np.zeros((1, MAXLEN), dtype=np.int32)
-            
-        url = str(url).lower().strip()
-        parsed = urlparse(url)
-        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        normalized_url = str(url).strip().lower()
+        if not normalized_url.startswith(("http://", "https://")):
+            normalized_url = "https://" + normalized_url
+
+        parsed = urlparse(normalized_url)
         domain = parsed.netloc or ""
         path = parsed.path or ""
-        final_url = domain + " " + path.replace("/", " / ")
+        # Split path with separators to retain structure cues
+        tokenizable_text = (domain + " " + path.replace("/", " / ")).strip()
 
-        seq = self.tokenizer.texts_to_sequences([final_url])
+        seq = self.tokenizer.texts_to_sequences([tokenizable_text])
         padded = pad_sequences(seq, maxlen=MAXLEN, padding="post", truncating="post")
         return padded
 
     def _virus_total_lookup(self, url: str) -> Dict[str, Any]:
-        """استعلام VirusTotal API"""
+        """Query VirusTotal URL analysis with safe timeouts and error handling."""
         vt_key = os.getenv("Virustotal_API_KEY")
         if not vt_key:
             logger.warning("⚠️ VirusTotal API key not found.")
@@ -130,13 +136,98 @@ class PhishingDetector:
 
         headers = {"x-apikey": vt_key}
         try:
-            r = requests.post("https://www.virustotal.com/api/v3/urls", headers=headers, data={"url": url})
-            analysis_id = r.json()["data"]["id"]
-            report = requests.get(f"https://www.virustotal.com/api/v3/analyses/{analysis_id}", headers=headers).json()
-            return report
-        except Exception as e:
+            submit = requests.post(
+                "https://www.virustotal.com/api/v3/urls",
+                headers=headers,
+                data={"url": url},
+                timeout=10,
+            )
+            if submit.status_code == 429:
+                logger.warning("⚠️ VirusTotal rate limit reached (429)")
+                return {"error": "rate_limited"}
+            submit.raise_for_status()
+            analysis_id = submit.json().get("data", {}).get("id")
+            if not analysis_id:
+                return {"error": "no_analysis_id", "raw": submit.text}
+
+            report_resp = requests.get(
+                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+                headers=headers,
+                timeout=10,
+            )
+            if report_resp.status_code == 429:
+                logger.warning("⚠️ VirusTotal rate limit reached on report (429)")
+                return {"error": "rate_limited"}
+            report_resp.raise_for_status()
+            return report_resp.json()
+        except requests.exceptions.Timeout:
+            logger.error("❌ VirusTotal lookup timed out")
+            return {"error": "timeout"}
+        except requests.exceptions.RequestException as e:
             logger.error(f"❌ VirusTotal lookup failed: {e}")
-            return {}
+            return {"error": "request_failed", "message": str(e)}
+
+    def _parse_vt_verdict(self, vt_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Summarize VirusTotal analysis into detections and verdict."""
+        if not vt_result or vt_result.get("error"):
+            return {
+                "verdict": "Unknown",
+                "detections": 0,
+                "stats": {},
+                "summary": vt_result.get("error") if isinstance(vt_result, dict) else "unavailable",
+            }
+
+        try:
+            attrs = vt_result.get("data", {}).get("attributes", {})
+            stats = attrs.get("stats", {})
+            malicious = int(stats.get("malicious", 0))
+            suspicious = int(stats.get("suspicious", 0))
+            undetected = int(stats.get("undetected", 0))
+            harmless = int(stats.get("harmless", 0))
+            detections = malicious + suspicious
+
+            if malicious > 0:
+                verdict = "Malicious"
+            elif suspicious > 0:
+                verdict = "Suspicious"
+            elif harmless > 0 and detections == 0:
+                verdict = "Safe"
+            else:
+                verdict = "Unknown"
+
+            return {
+                "verdict": verdict,
+                "detections": detections,
+                "stats": stats,
+                "summary": f"{malicious} malicious, {suspicious} suspicious, {harmless} harmless, {undetected} undetected",
+            }
+        except Exception as e:
+            logger.error(f"❌ Failed to parse VirusTotal result: {e}")
+            return {"verdict": "Unknown", "detections": 0, "stats": {}, "summary": "parse_error"}
+
+    @staticmethod
+    def _label_from_score(score: float) -> str:
+        if score > 0.7:
+            return "Malicious"
+        if score > 0.4:
+            return "Suspicious"
+        return "Safe"
+
+    @staticmethod
+    def _reason_from_features(url: str, score: float, vt_summary: Optional[Dict[str, Any]] = None) -> str:
+        # Lightweight heuristic reasoning to aid UI
+        hints: list[str] = []
+        if re.search(r"\d{1,3}(?:\.\d{1,3}){3}", url):
+            hints.append("URL contains raw IP address")
+        if any(tld in url for tld in [".tk", ".ml", ".ga", ".cf", ".gq"]):
+            hints.append("Suspicious TLD present")
+        if "@" in url or "//" in url[8:]:  # after scheme
+            hints.append("Potential obfuscation patterns")
+        if vt_summary and vt_summary.get("detections", 0) > 0:
+            hints.append(f"VirusTotal engines flagged: {vt_summary['detections']}")
+        if not hints:
+            return f"Model risk score {score:.2f} with no obvious red flags detected"
+        return f"Model risk score {score:.2f}. Indicators: " + "; ".join(hints)
 
     def _ask_gemini(self, local_pred: float, vt_result: Dict[str, Any], url: str) -> Dict[str, Any]:
         """إرسال النتائج إلى Gemini لتحليل نهائي"""
@@ -171,12 +262,7 @@ class PhishingDetector:
                 "recommendations": ["Manual review required - Gemini configuration failed"]
             }
 
-        if local_pred > 0.7:
-            local_class = "Malicious"
-        elif local_pred > 0.4:
-            local_class = "Suspicious"
-        else:
-            local_class = "Safe"
+        local_class = self._label_from_score(local_pred)
 
         prompt = f"""
         Analyze the following phishing detection information and decide the final classification.
@@ -205,39 +291,94 @@ class PhishingDetector:
             }
 
     def detect_phishing(self, request: PhishingDetectionRequest) -> PhishingDetectionResponse:
-        """التحليل الكامل للـ URL"""
+        """Full URL analysis: validate, model predict, VirusTotal reputation, and structured summary."""
         try:
-            # Check if model is loaded
+            # 0️⃣ Validate URL early
+            validation = validate_url(request.url)
+            if not validation.get("valid"):
+                return PhishingDetectionResponse(
+                    classification="Error",
+                    confidence=0.0,
+                    risk_score=0.0,
+                    analysis_details={"error": validation.get("error", "invalid_url"), "url": request.url},
+                    recommendations=["Provide a valid URL including domain."]
+                )
+
+            # Ensure model availability
             if self.model is None:
                 logger.error("❌ Model not loaded")
                 return PhishingDetectionResponse(
                     classification="Error",
                     confidence=0.0,
                     risk_score=0.0,
-                    analysis_details={"error": "Model not loaded"},
+                    analysis_details={"error": "model_not_loaded"},
                     recommendations=["Model loading failed - manual review required"]
                 )
-            
-            # 1️⃣ تجهيز الداتا وإرسالها للموديل
+
+            # 1️⃣ Model prediction
             padded = self._preprocess_for_model(request.url)
             prediction = float(self.model.predict(padded)[0][0])
+            model_label = self._label_from_score(prediction)
 
-            # 2️⃣ فحص VirusTotal (اختياري)
-            vt_result = self._virus_total_lookup(request.url) if request.check_reputation else {}
+            # 2️⃣ VirusTotal reputation (optional)
+            vt_raw = self._virus_total_lookup(request.url) if request.check_reputation else {}
+            vt_summary = self._parse_vt_verdict(vt_raw) if request.check_reputation else {"verdict": "Unknown", "detections": 0, "stats": {}, "summary": "disabled"}
 
-            # 3️⃣ تحليل Gemini (قرار نهائي)
-            gemini_decision = self._ask_gemini(prediction, vt_result, request.url)
+            # 3️⃣ Notes/insights on disagreement
+            notes: list[str] = []
+            if request.check_reputation and vt_summary.get("verdict") != "Unknown" and vt_summary.get("verdict") != model_label:
+                notes.append("Model and VirusTotal verdicts differ; consider manual review.")
+                if vt_summary.get("detections", 0) == 0 and model_label in ("Suspicious", "Malicious"):
+                    notes.append("Possible model false positive or VirusTotal not yet updated.")
+                if vt_summary.get("detections", 0) > 0 and model_label == "Safe":
+                    notes.append("Model may have missed indicators flagged by VT engines.")
 
-            return PhishingDetectionResponse(
-                classification=gemini_decision.get("classification", "Unknown"),
-                confidence=gemini_decision.get("confidence", prediction),
-                risk_score=gemini_decision.get("risk_score", prediction),
-                analysis_details={
-                    "local_prediction": prediction,
-                    "virustotal": vt_result,
-                    "gemini_raw": gemini_decision
+            # Lightweight reasoning for model verdict
+            reason = self._reason_from_features(request.url, prediction, vt_summary)
+
+            # Build structured analysis details for frontend
+            analysis = {
+                "model": {
+                    "score": prediction,
+                    "label": model_label,
+                    "reason": reason,
                 },
-                recommendations=gemini_decision.get("recommendations", [])
+                "virustotal": {
+                    "verdict": vt_summary.get("verdict"),
+                    "detections": vt_summary.get("detections"),
+                    "stats": vt_summary.get("stats"),
+                    "summary": vt_summary.get("summary"),
+                },
+                "notes": notes,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "url": request.url,
+                # Keep raw under a nested key to avoid bloating the main object
+                "raw": {"virustotal": vt_raw} if request.check_reputation else {},
+            }
+
+            # Recommendations based on risk
+            recommendations: list[str] = []
+            if model_label == "Malicious" or vt_summary.get("verdict") == "Malicious":
+                recommendations = [
+                    "Block the URL at network perimeter",
+                    "Do not visit or submit credentials",
+                    "Investigate related indicators (domains, IPs)"
+                ]
+            elif model_label == "Suspicious" or vt_summary.get("verdict") == "Suspicious":
+                recommendations = [
+                    "Open in isolated environment if needed",
+                    "Perform manual verification and WHOIS/DNS checks"
+                ]
+            else:
+                recommendations = ["No immediate action required. Continue monitoring."]
+
+            # Return top-level focused on model verdict for clarity; details contain VT and notes
+            return PhishingDetectionResponse(
+                classification=model_label,
+                confidence=float(prediction),
+                risk_score=float(prediction),
+                analysis_details=analysis,
+                recommendations=recommendations,
             )
 
         except Exception as e:

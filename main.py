@@ -250,47 +250,94 @@ elif page == "🔗 URL Checker":
             if response and response.status_code == 200:
                 result = response.json()
                 
-                st.markdown("### 🔍 Analysis Results")
-                
-                classification = result.get("classification", "Unknown")
+                details = result.get("details", {})
+                model_section = details.get("model", {})
+                vt_section = details.get("virustotal", {})
+                gemini_final = details.get("gemini_final", {})
+                notes = details.get("notes", [])
+                timestamp = details.get("timestamp")
+                analyzed_url = details.get("url", url_input)
+
+                # Header with URL and date
+                st.markdown(f"**URL:** {analyzed_url}")
+                if timestamp:
+                    st.markdown(f"**Analysis Date:** {timestamp}")
+
+                # Risk header based on model verdict
+                classification = result.get("classification", gemini_final.get("final_label", model_section.get("label", "Unknown")))
                 confidence = result.get("confidence", 0)
-                threat_level = result.get("threat_level", "Low")
-                risk_score = result.get("risk_score", 0)
-                
+                risk_score = model_section.get("score", result.get("risk_score", 0))
+
                 if classification == "Malicious":
-                    st.markdown(f'<div class="status-malicious">🚨 {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="status-malicious">🔴 {classification}</div>', unsafe_allow_html=True)
                 elif classification == "Suspicious":
-                    st.markdown(f'<div class="status-suspicious">⚠️ {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="status-suspicious">🟡 {classification}</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown(f'<div class="status-safe">✅ {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
-                
-                st.markdown("### 📊 Model Output")
+                    st.markdown(f'<div class="status-safe">🟢 {classification}</div>', unsafe_allow_html=True)
+
+                # Model Verdict card
+                st.markdown("### 🧠 Model Verdict")
                 st.markdown(f"""
                 <div class="model-output">
-                    <strong>Classification:</strong> {classification}<br>
-                    <strong>Confidence:</strong> {confidence:.2%}<br>
-                    <strong>Threat Level:</strong> {threat_level}<br>
-                    <strong>Risk Score:</strong> {risk_score:.2f}/1.0
+                    <strong>Risk Score:</strong> {risk_score:.2f} / 1.0<br>
+                    <strong>Final Label:</strong> {classification}<br>
+                    <strong>Reason:</strong> {model_section.get('reason', 'No reasoning available')}
                 </div>
                 """, unsafe_allow_html=True)
-                
+
+                # VirusTotal Verdict card
+                st.markdown("### 🧪 VirusTotal Verdict")
+                vt_verdict = vt_section.get("verdict", "Unknown")
+                vt_detections = vt_section.get("detections", 0)
+                vt_summary = vt_section.get("summary", "Unavailable")
+                st.markdown(f"""
+                <div class="ai-explanation">
+                    <strong>Detections:</strong> {vt_detections}<br>
+                    <strong>Verdict:</strong> {vt_verdict}<br>
+                    <strong>Summary:</strong> {vt_summary}
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Gemini Final Verdict section
+                st.markdown("### 🤖 Gemini Final Verdict")
+                final_label = gemini_final.get("final_label", classification)
+                final_threat = gemini_final.get("threat_level", result.get("threat_level", "Low"))
+                final_expl = gemini_final.get("explanation", result.get("explanation", ""))
+                st.markdown(f"""
+                <div class="ai-explanation">
+                    <strong>Final Label:</strong> {final_label}<br>
+                    <strong>Threat Level:</strong> {final_threat}<br>
+                    <strong>Explanation:</strong> {final_expl}
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Notes/Insights section
+                st.markdown("### 📝 Notes / Insights")
+                if notes:
+                    for n in notes:
+                        st.info(n)
+                else:
+                    st.info("Model and VirusTotal results are in agreement or insufficient data.")
+
+                # Explanation and recommendation from AI
+                explanation = result.get("explanation", gemini_final.get("explanation", "No explanation available"))
                 st.markdown("### 🤖 AI Explanation")
-                explanation = result.get("explanation", "No explanation available")
                 st.markdown(f"""
                 <div class="ai-explanation">
                     {explanation}
                 </div>
                 """, unsafe_allow_html=True)
-                
+
                 recommended_action = result.get("recommended_action", "")
                 if recommended_action:
                     st.markdown("### 📋 Recommended Action")
                     st.info(recommended_action)
-                
-                details = result.get("details", {})
-                if details:
-                    with st.expander("📊 Additional Details"):
-                        st.json(details)
+
+                # Optional: show performance metrics
+                perf = details.get("performance_metrics")
+                if perf:
+                    with st.expander("⏱️ Performance Metrics"):
+                        st.json(perf)
             else:
                 st.error(f"Backend error: {response.json().get('detail', 'Unknown error') if response else err}")
         except Exception as e:
