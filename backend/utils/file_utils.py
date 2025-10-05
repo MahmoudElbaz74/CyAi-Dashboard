@@ -6,7 +6,12 @@ Handles file operations, validation, and processing
 import hashlib
 import os
 from typing import Optional, List, Dict, Any
-import magic
+try:
+    import magic
+    MAGIC_AVAILABLE = True
+except ImportError:
+    magic = None
+    MAGIC_AVAILABLE = False
 import logging
 
 logger = logging.getLogger(__name__)
@@ -29,7 +34,10 @@ def validate_file_type(file_path: str, allowed_types: List[str]) -> bool:
             return False
         
         # Check MIME type
-        mime_type = magic.from_file(file_path, mime=True)
+        if MAGIC_AVAILABLE and magic:
+            mime_type = magic.from_file(file_path, mime=True)
+        else:
+            mime_type = "application/octet-stream"
         allowed_mime_types = {
             '.exe': ['application/x-executable', 'application/x-msdownload'],
             '.pdf': ['application/pdf'],
@@ -120,7 +128,10 @@ def get_file_metadata(file_content: bytes, filename: str) -> Dict[str, Any]:
         
         # Try to get MIME type
         try:
-            metadata['mime_type'] = magic.from_buffer(file_content, mime=True)
+            if MAGIC_AVAILABLE and magic:
+                metadata['mime_type'] = magic.from_buffer(file_content, mime=True)
+            else:
+                metadata['mime_type'] = "application/octet-stream"
         except:
             metadata['mime_type'] = 'unknown'
         

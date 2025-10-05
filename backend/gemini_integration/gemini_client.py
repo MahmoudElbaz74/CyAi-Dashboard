@@ -11,11 +11,19 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Get Google API key from environment
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+	raise ValueError("❌ GOOGLE_API_KEY not found in environment variables. Please set GOOGLE_API_KEY in your .env file or environment.")
+
 logger = logging.getLogger(__name__)
 
 # Optional import: allow server to start without the SDK
 try:
 	import google.generativeai as genai  # type: ignore
+	# Configure Gemini with the API key
+	genai.configure(api_key=GOOGLE_API_KEY)
+	logger.info("✅ Gemini API configured successfully")
 except Exception as e:  # pragma: no cover
 	genai = None
 	logger.warning("google.generativeai not available; falling back to non-AI explanations. Install 'google-generativeai' to enable.")
@@ -30,29 +38,33 @@ class GeminiClient:
 		Initialize Gemini client
 		
 		Args:
-			api_key: Gemini API key (if None, will try to get from environment)
+			api_key: Gemini API key (if None, will use the pre-configured key)
 		"""
-		self.api_key = api_key or os.getenv('GEMINI_API_KEY')
+		self.api_key = api_key or GOOGLE_API_KEY
 		self.model = None
 		
-		if not self.api_key:
-			logger.warning("GEMINI_API_KEY not set; AI explanations will use fallback responses.")
-		elif genai is None:
+		if genai is None:
 			logger.warning("Gemini SDK not available; AI explanations will use fallback responses.")
 		else:
 			try:
-				os.environ["GOOGLE_API_KEY"] = self.api_key
 				# Prefer GenerativeModel if available; otherwise fall back to Client
 				self.model = None
 				self.client = None
 				self._use_client = False
-				if hasattr(genai, 'GenerativeModel'):
-					self.model = genai.GenerativeModel('models/gemini-2.5-pro')
-				elif hasattr(genai, 'Client'):
-					self.client = genai.Client(api_key=self.api_key)
-					self._use_client = True
-				else:
-					raise RuntimeError("google.generativeai SDK missing required classes")
+				try:
+					if hasattr(genai, 'GenerativeModel'):
+						self.model = genai.GenerativeModel('models/gemini-2.5-pro')
+					elif hasattr(genai, 'Client'):
+						self.client = genai.Client(api_key=self.api_key)
+						self._use_client = True
+					else:
+						# Use the pre-configured genai instance
+						self.model = genai.GenerativeModel('models/gemini-2.5-pro')
+				except Exception as e:
+					logger.warning(f"Failed to initialize Gemini model: {e}")
+					self.model = None
+					self.client = None
+					self._use_client = False
 				logger.info("Gemini client initialized successfully")
 			except Exception as e:  # pragma: no cover
 				logger.warning(f"Failed to initialize Gemini model; using fallbacks: {e}")
@@ -232,7 +244,7 @@ Format as JSON with:
 		return prompt
 	
 	async def _generate_response(self, prompt: str) -> str:
-		"""Generate response from Gemini or raise to trigger fallbacks"""
+		"""Generate response from Gemini or return fallback"""
 		try:
 			if getattr(self, '_use_client', False) and self.client is not None:
 				response = self.client.models.generate_content(model='models/gemini-2.5-pro', contents=prompt)
@@ -244,10 +256,13 @@ Format as JSON with:
 			elif self.model is not None:
 				response = self.model.generate_content(prompt)
 				return response.text
-			raise RuntimeError("Gemini model unavailable")
+			else:
+				# Return fallback response when Gemini is not available
+				return self._get_fallback_ai_response(prompt)
 		except Exception as e:  # pragma: no cover
 			logger.error(f"Error generating Gemini response: {e}")
-			raise
+			# Return fallback response instead of raising
+			return self._get_fallback_ai_response(prompt)
 	
 	def _parse_explanation_response(self, response: str, classification: str, confidence: float) -> Dict[str, Any]:
 		"""Parse explanation response from Gemini"""
@@ -323,6 +338,82 @@ Format as JSON with:
 			return "Medium"
 		else:
 			return "Low"
+	
+	def _get_fallback_ai_response(self, prompt: str) -> str:
+		"""Provide fallback AI response when Gemini is unavailable"""
+		# Analyze the prompt to provide a relevant fallback response
+		prompt_lower = prompt.lower()
+		
+		if "explain" in prompt_lower or "analysis" in prompt_lower:
+			return """**AI Analysis (Fallback Mode)**
+
+Based on the provided data, here's my cybersecurity analysis:
+
+**Key Findings:**
+- The system has detected potential security indicators that require attention
+- Analysis shows various patterns that suggest both normal and potentially suspicious activity
+- Confidence levels indicate the reliability of the detection
+
+**Recommendations:**
+1. **Immediate Action**: Review the flagged items for any immediate threats
+2. **Investigation**: Conduct deeper analysis of suspicious patterns
+3. **Monitoring**: Enhance monitoring for similar indicators
+4. **Documentation**: Document findings for future reference
+
+**Note**: This is a fallback analysis. For advanced AI-powered insights, please configure the Google API key.
+
+**Next Steps:**
+- Set up GEMINI_API_KEY environment variable for enhanced AI analysis
+- Review the detailed findings in the analysis results
+- Implement recommended security measures based on the findings"""
+		
+		elif "correlate" in prompt_lower or "correlation" in prompt_lower:
+			return """**Correlation Analysis (Fallback Mode)**
+
+**Temporal Patterns:**
+- Analysis of time-based indicators shows potential clustering of events
+- Some activities appear to follow predictable patterns
+
+**Behavioral Correlations:**
+- Similar attack vectors or techniques detected across different indicators
+- Consistent patterns in the observed activities
+
+**Infrastructure Correlations:**
+- Shared infrastructure elements identified across multiple indicators
+- Common network characteristics or domains
+
+**Recommendations:**
+1. Investigate shared infrastructure elements
+2. Look for common attack patterns
+3. Check for coordinated activities
+4. Review temporal clustering for potential campaigns
+
+**Note**: Enhanced correlation analysis available with Google API key configuration."""
+		
+		else:
+			return """**Cybersecurity Analysis (Fallback Mode)**
+
+**Summary:**
+The system has analyzed the provided cybersecurity data and identified several key indicators that require attention.
+
+**Key Points:**
+- Multiple security indicators have been detected
+- Various confidence levels suggest different degrees of certainty
+- Both automated and manual review may be necessary
+
+**Immediate Actions:**
+1. Review all flagged items for immediate threats
+2. Investigate high-confidence detections first
+3. Document findings for security team review
+4. Implement appropriate security measures
+
+**Long-term Recommendations:**
+1. Enhance monitoring capabilities
+2. Improve detection accuracy
+3. Develop response procedures
+4. Regular security assessments
+
+**Note**: For advanced AI-powered analysis with detailed explanations, threat intelligence, and remediation steps, please configure the GEMINI_API_KEY environment variable."""
 
 # Global client instance
 _gemini_client = None

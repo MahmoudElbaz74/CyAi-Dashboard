@@ -13,10 +13,36 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from pydantic import BaseModel
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.preprocessing.text import tokenizer_from_json
-import google.generativeai as genai
+# TensorFlow/Keras imports with fallbacks
+try:
+    from tensorflow.keras.models import load_model
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    from tensorflow.keras.preprocessing.text import tokenizer_from_json
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    try:
+        # Fallback for newer TensorFlow versions
+        from keras.models import load_model
+        from keras.preprocessing.sequence import pad_sequences
+        from keras.preprocessing.text import tokenizer_from_json
+        TENSORFLOW_AVAILABLE = True
+    except ImportError:
+        # If neither works, create dummy functions
+        TENSORFLOW_AVAILABLE = False
+        def load_model(*args, **kwargs):
+            return None
+        def pad_sequences(*args, **kwargs):
+            return None
+        def tokenizer_from_json(*args, **kwargs):
+            return None
+
+# Google GenerativeAI import with fallback
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    genai = None
+    GEMINI_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +71,45 @@ class PhishingDetector:
 
     def _load_model(self):
         """تحميل الموديل و الـ tokenizer"""
+        if not TENSORFLOW_AVAILABLE:
+            logger.error("❌ TensorFlow/Keras not available")
+            self.model = None
+            self.tokenizer = None
+            return
+            
         try:
+            # Check if model file exists
+            if not os.path.exists(self.model_path):
+                logger.error(f"❌ Model file not found: {self.model_path}")
+                self.model = None
+                self.tokenizer = None
+                return
+            
+            if not os.path.exists(self.tokenizer_path):
+                logger.error(f"❌ Tokenizer file not found: {self.tokenizer_path}")
+                self.model = None
+                self.tokenizer = None
+                return
+            
             self.model = load_model(self.model_path)
             with open(self.tokenizer_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                self.tokenizer = tokenizer_from_json(data)
+                # Convert dict to JSON string before passing to tokenizer_from_json
+                self.tokenizer = tokenizer_from_json(json.dumps(data))
             logger.info("✅ Keras model and tokenizer loaded successfully.")
         except Exception as e:
             logger.error(f"❌ Failed to load model/tokenizer: {e}")
-            raise
+            # Set to None to prevent errors in prediction
+            self.model = None
+            self.tokenizer = None
 
     def _preprocess_for_model(self, url: str) -> np.ndarray:
         """تجهيز URL بنفس طريقة التدريب"""
+        if self.tokenizer is None:
+            logger.error("❌ Tokenizer not loaded")
+            # Return dummy data to prevent crashes
+            return np.zeros((1, MAXLEN), dtype=np.int32)
+            
         url = str(url).lower().strip()
         parsed = urlparse(url)
         clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -87,13 +140,36 @@ class PhishingDetector:
 
     def _ask_gemini(self, local_pred: float, vt_result: Dict[str, Any], url: str) -> Dict[str, Any]:
         """إرسال النتائج إلى Gemini لتحليل نهائي"""
-        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not GEMINI_AVAILABLE or genai is None:
+            logger.warning("⚠️ Google GenerativeAI not available")
+            return {
+                "classification": "Safe" if local_pred < 0.4 else "Suspicious" if local_pred < 0.7 else "Malicious",
+                "confidence": float(local_pred),
+                "risk_score": float(local_pred),
+                "recommendations": ["Manual review required - AI analysis unavailable"]
+            }
+            
+        gemini_key = os.getenv("GOOGLE_API_KEY")
         if not gemini_key:
             logger.error("❌ GEMINI_API_KEY not found in environment.")
-            return {}
+            return {
+                "classification": "Safe" if local_pred < 0.4 else "Suspicious" if local_pred < 0.7 else "Malicious",
+                "confidence": float(local_pred),
+                "risk_score": float(local_pred),
+                "recommendations": ["Manual review required - API key not found"]
+            }
 
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel("models/gemini-1.5-pro")
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel("models/gemini-1.5-pro")
+        except Exception as e:
+            logger.error(f"❌ Failed to configure Gemini: {e}")
+            return {
+                "classification": "Safe" if local_pred < 0.4 else "Suspicious" if local_pred < 0.7 else "Malicious",
+                "confidence": float(local_pred),
+                "risk_score": float(local_pred),
+                "recommendations": ["Manual review required - Gemini configuration failed"]
+            }
 
         if local_pred > 0.7:
             local_class = "Malicious"
@@ -131,6 +207,17 @@ class PhishingDetector:
     def detect_phishing(self, request: PhishingDetectionRequest) -> PhishingDetectionResponse:
         """التحليل الكامل للـ URL"""
         try:
+            # Check if model is loaded
+            if self.model is None:
+                logger.error("❌ Model not loaded")
+                return PhishingDetectionResponse(
+                    classification="Error",
+                    confidence=0.0,
+                    risk_score=0.0,
+                    analysis_details={"error": "Model not loaded"},
+                    recommendations=["Model loading failed - manual review required"]
+                )
+            
             # 1️⃣ تجهيز الداتا وإرسالها للموديل
             padded = self._preprocess_for_model(request.url)
             prediction = float(self.model.predict(padded)[0][0])

@@ -164,8 +164,6 @@ CORS_ORIGINS=*
 From project root, install backend and frontend deps:
 ```bash
 # (Optional) python -m venv venv && venv\Scripts\activate  # Windows
-pip install -r backend/requirements.txt
-pip install -r frontend/requirements.txt
 ```
 
 ### Run Backend
@@ -174,12 +172,9 @@ uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 venv\Scripts\activate
 
-cd frontend
-streamlit run app.py
-
 ### Run Frontend
 ```bash
-streamlit run frontend/app.py
+streamlit run main.py
 ```
 
 ### Verify

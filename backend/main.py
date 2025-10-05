@@ -6,6 +6,8 @@ import sys
 import os
 import logging
 import asyncio
+import time
+from datetime import datetime
 
 # Add the backend directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +37,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Global model manager instance
+_model_manager = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize models on startup to avoid loading delays during requests"""
+    global _model_manager
+    logger.info("🚀 Starting CyAi Dashboard API...")
+    start_time = time.time()
+    
+    try:
+        # Initialize model manager
+        _model_manager = ModelManager()
+        load_time = time.time() - start_time
+        logger.info(f"✅ All models loaded successfully in {load_time:.2f} seconds")
+        
+        # Log model status
+        models_info = _model_manager.get_all_models_info()
+        logger.info(f"📊 Model status: {models_info['status']}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize models: {e}")
+        raise
+
+def get_model_manager() -> ModelManager:
+    """
+    Get the global model manager instance (singleton pattern)
+    
+    Returns:
+        ModelManager instance
+    """
+    global _model_manager
+    if _model_manager is None:
+        logger.warning("⚠️ Model manager not initialized! This should not happen after startup.")
+        _model_manager = ModelManager()
+    return _model_manager
 
 # Pydantic models for requests/responses
 class LogAnalysisRequest(BaseModel):
@@ -80,7 +119,7 @@ class AIAssistantRequest(BaseModel):
 
     class Config:
         # Allow population by both alias ('query') and field name ('text') for backward compatibility
-        allow_population_by_field_name = True
+        populate_by_name = True
 
 class AIAssistantResponse(BaseModel):
     explanation: str
@@ -212,9 +251,17 @@ async def analyze_url(
     Returns:
         URL analysis result with AI explanation
     """
+    start_time = time.time()
+    request_id = f"req_{int(time.time() * 1000)}"
+    
     try:
+        logger.info(f"🔍 [{request_id}] Starting URL analysis for: {request.url}")
+        
         # Get phishing detector model
+        model_start = time.time()
         phishing_detector = model_manager.get_phishing_detector()
+        model_time = time.time() - model_start
+        logger.info(f"⚡ [{request_id}] Model loaded in {model_time:.3f}s")
         
         # Detect phishing
         from models.phishing_detector import PhishingDetectionRequest
@@ -224,9 +271,13 @@ async def analyze_url(
             check_reputation=True
         )
         
+        detection_start = time.time()
         detection_result = phishing_detector.detect_phishing(detection_request)
+        detection_time = time.time() - detection_start
+        logger.info(f"🎯 [{request_id}] Phishing detection completed in {detection_time:.3f}s - Result: {detection_result.classification}")
         
         # Get AI explanation
+        gemini_start = time.time()
         try:
             explanation_data = await gemini_client.get_explanation(
                 analysis_type="url",
@@ -240,11 +291,19 @@ async def analyze_url(
             recommended_action = explanation_data.get("recommended_action", "Review and investigate")
             threat_level = explanation_data.get("threat_level", "Low")
             
+            gemini_time = time.time() - gemini_start
+            logger.info(f"🤖 [{request_id}] Gemini explanation completed in {gemini_time:.3f}s")
+            
         except Exception as e:
-            logger.error(f"Error getting Gemini explanation: {e}")
+            logger.error(f"❌ [{request_id}] Error getting Gemini explanation: {e}")
             explanation = f"URL classified as {detection_result.classification} with {detection_result.confidence:.2%} confidence. AI explanation unavailable."
             recommended_action = "Review and investigate as needed"
             threat_level = "Unknown"
+            gemini_time = time.time() - gemini_start
+            logger.info(f"⚠️ [{request_id}] Using fallback explanation after {gemini_time:.3f}s")
+        
+        total_time = time.time() - start_time
+        logger.info(f"✅ [{request_id}] URL analysis completed successfully in {total_time:.3f}s")
         
         return URLAnalysisResponse(
             classification=detection_result.classification,
@@ -256,13 +315,28 @@ async def analyze_url(
             details={
                 "analysis_details": detection_result.analysis_details,
                 "recommendations": detection_result.recommendations,
-                "url_analysis": detection_result.analysis_details.get("url_analysis", {})
+                "url_analysis": detection_result.analysis_details.get("url_analysis", {}),
+                "performance_metrics": {
+                    "total_time": round(total_time, 3),
+                    "model_load_time": round(model_time, 3),
+                    "detection_time": round(detection_time, 3),
+                    "gemini_time": round(gemini_time, 3)
+                }
             }
         )
         
     except Exception as e:
-        logger.error(f"Error in URL analysis: {e}")
-        raise HTTPException(status_code=500, detail=f"URL analysis failed: {str(e)}")
+        total_time = time.time() - start_time
+        logger.error(f"❌ [{request_id}] Error in URL analysis after {total_time:.3f}s: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "error": "URL analysis failed",
+                "message": str(e),
+                "request_id": request_id,
+                "processing_time": round(total_time, 3)
+            }
+        )
 
 @app.post("/analyze-file", response_model=FileAnalysisResponse)
 async def analyze_file(
