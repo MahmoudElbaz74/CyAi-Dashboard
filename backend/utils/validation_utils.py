@@ -1,5 +1,5 @@
 """
-Validation utility functions for CyAi Dashboard
+Validation utility functions for CyFort AI
 Handles input validation and sanitization
 """
 

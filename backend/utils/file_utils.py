@@ -1,5 +1,5 @@
 """
-File utility functions for CyAi Dashboard
+File utility functions for CyFort AI
 Handles file operations, validation, and processing
 """
 

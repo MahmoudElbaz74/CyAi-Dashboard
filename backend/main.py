@@ -1,13 +1,23 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import sys
 import os
 import logging
 import asyncio
 import time
 from datetime import datetime
+import tempfile
+import subprocess
+import json
+import shutil
+from pathlib import Path
+import math
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 # Add the backend directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,16 +28,22 @@ from ai_agent import get_ai_agent, AIAgent
 from utils.logging_utils import setup_logging, log_analysis_result
 from utils.validation_utils import validate_model_input
 from utils.file_utils import get_file_metadata, is_safe_file_size
+from fastapi.staticfiles import StaticFiles
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="CyAi Dashboard API",
-    description="Cybersecurity AI Dashboard with Pre-trained Models and Gemini Integration",
+    title="CyFort AI API",
+    description="CyFort AI: Cybersecurity Analysis with Pre-trained Models and Gemini Integration",
     version="2.0.0"
 )
+# Serve static dashboard assets (if present)
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -45,7 +61,7 @@ _model_manager = None
 async def startup_event():
     """Initialize models on startup to avoid loading delays during requests"""
     global _model_manager
-    logger.info("🚀 Starting CyAi Dashboard API...")
+    logger.info("🚀 Starting CyFort AI API...")
     start_time = time.time()
     
     try:
@@ -130,10 +146,226 @@ class AIAssistantResponse(BaseModel):
     recommended_action: str
     confidence: float
 
+
+class PcapAnalysisResponse(BaseModel):
+    model_summary: Dict[str, Any]
+    gemini_analysis: List[Dict[str, Any]]
+    final_verdict: str
+    classified_logs: Optional[List[Dict[str, Any]]] = None
+    recommendations: Optional[List[str]] = None
+
+
+def _get_packet_model_path() -> Path:
+    base_dir = Path(__file__).parent / "models"
+    return base_dir / "packet_model.pt"
+
+
+_packet_model = None
+
+
+def get_packet_model():
+    """Lazy-load and cache the local PyTorch packet model."""
+    global _packet_model
+    if _packet_model is not None:
+        return _packet_model
+    model_path = _get_packet_model_path()
+    if not model_path.exists():
+        logger.warning(f"packet_model.pt not found at {model_path}; will use rule-based fallback.")
+        _packet_model = None
+        return _packet_model
+    if torch is None:
+        logger.warning("PyTorch not available; will use rule-based fallback.")
+        _packet_model = None
+        return _packet_model
+    try:
+        _packet_model = torch.jit.load(str(model_path)) if str(model_path).endswith('.pt') else torch.load(str(model_path), map_location='cpu')
+        if hasattr(_packet_model, 'eval'):
+            _packet_model.eval()
+        logger.info("Packet model loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load packet model: {e}")
+        _packet_model = None
+    return _packet_model
+
+
+def _run_tshark_extract(input_path: Path) -> Tuple[Path, List[Dict[str, Any]]]:
+    """Run tshark to extract readable logs into a temp JSON file and return parsed records."""
+    tmp_json = Path(tempfile.mkstemp(prefix="pcap_logs_", suffix=".json")[1])
+    fields = [
+        'frame.time_epoch',
+        'ip.src',
+        'ip.dst',
+        '_ws.col.Protocol',
+        'frame.len',
+        '_ws.col.Info'
+    ]
+    cmd = [
+        'tshark', '-r', str(input_path),
+        '-T', 'json',
+        '-e', 'frame.time_epoch',
+        '-e', 'ip.src',
+        '-e', 'ip.dst',
+        '-e', '_ws.col.Protocol',
+        '-e', 'frame.len',
+        '-e', '_ws.col.Info'
+    ]
+    try:
+        # Prefer -T jsonraw for structure; fall back to fields CSV-style if json fails
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # tshark -T json returns a JSON array of packets with layers; best-effort parse
+        data = json.loads(result.stdout)
+        records: List[Dict[str, Any]] = []
+        for pkt in data:
+            layers = pkt.get('_source', {}).get('layers', {})
+            def first(layer_key: str) -> Optional[str]:
+                val = layers.get(layer_key)
+                if isinstance(val, list) and val:
+                    return val[0]
+                if isinstance(val, str):
+                    return val
+                return None
+            ts = first('frame.time_epoch') or first('frame.time') or ''
+            src = first('ip.src') or ''
+            dst = first('ip.dst') or ''
+            proto = first('_ws.col.Protocol') or first('ip.proto') or ''
+            length = first('frame.len') or '0'
+            info = first('_ws.col.Info') or ''
+            try:
+                length_int = int(float(length))
+            except Exception:
+                length_int = 0
+            records.append({
+                'timestamp': ts,
+                'src_ip': src,
+                'dst_ip': dst,
+                'protocol': proto,
+                'length': length_int,
+                'info': info
+            })
+        tmp_json.write_text(json.dumps(records, ensure_ascii=False))
+        return tmp_json, records
+    except subprocess.CalledProcessError as e:
+        logger.error(f"tshark failed: {e.stderr}")
+        raise HTTPException(status_code=500, detail="tshark processing failed. Ensure tshark is installed and the pcap is valid.")
+    except json.JSONDecodeError:
+        # Fallback: try fields mode to TSV then convert
+        tmp_txt = Path(tempfile.mkstemp(prefix="pcap_logs_", suffix=".txt")[1])
+        cmd_f = [
+            'tshark', '-r', str(input_path),
+            '-T', 'fields', '-E', 'separator=\t',
+            *sum([['-e', f] for f in fields], [])
+        ]
+        try:
+            result2 = subprocess.run(cmd_f, capture_output=True, text=True, check=True)
+            lines = [ln for ln in result2.stdout.splitlines() if ln.strip()]
+            records = []
+            for ln in lines:
+                parts = ln.split('\t')
+                while len(parts) < len(fields):
+                    parts.append('')
+                ts, src, dst, proto, length, info = parts[:6]
+                try:
+                    length_int = int(float(length))
+                except Exception:
+                    length_int = 0
+                records.append({
+                    'timestamp': ts,
+                    'src_ip': src,
+                    'dst_ip': dst,
+                    'protocol': proto,
+                    'length': length_int,
+                    'info': info
+                })
+            tmp_json.write_text(json.dumps(records, ensure_ascii=False))
+            try:
+                if tmp_txt.exists():
+                    tmp_txt.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            return tmp_json, records
+        except Exception as e2:
+            logger.error(f"tshark fallback failed: {e2}")
+            raise HTTPException(status_code=500, detail="Failed to extract logs from pcap.")
+
+
+def _simple_rule_based_classify(rec: Dict[str, Any]) -> Tuple[str, float]:
+    """Fallback classification if model unavailable."""
+    proto = (rec.get('protocol') or '').upper()
+    length = int(rec.get('length') or 0)
+    info = (rec.get('info') or '').lower()
+    score = 0.0
+    # Simple heuristics
+    if proto in ("TCP", "UDP") and length > 1500:
+        score += 0.6
+    if any(k in info for k in ["syn", "fin", "scan", "exploit", "smb", "powershell", "meterpreter", "sqlmap", "nmap"]):
+        score += 0.5
+    if "dns" in proto and ("exfil" in info or "tunn" in info):
+        score += 0.5
+    if score >= 0.9:
+        return "Malicious", min(score, 1.0)
+    if score >= 0.6:
+        return "Suspicious", score
+    return "Benign", 1.0 - score
+
+
+def _featurize_for_model(rec: Dict[str, Any]) -> Optional['torch.Tensor']:
+    if torch is None:
+        return None
+    try:
+        length = float(rec.get('length') or 0)
+        proto = (rec.get('protocol') or '').upper()
+        proto_map = {"TCP": 1.0, "UDP": 2.0, "ICMP": 3.0, "DNS": 4.0, "HTTP": 5.0, "TLS": 6.0}
+        proto_id = proto_map.get(proto, 0.0)
+        # Very small numeric feature vector as generic input
+        vec = torch.tensor([length, proto_id], dtype=torch.float32).unsqueeze(0)
+        return vec
+    except Exception:
+        return None
+
+
+async def _analyze_with_gemini(gemini_client: GeminiClient, logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Chunk logs and request deep analysis with mapping to MITRE."""
+    if not logs:
+        return []
+    # Chunk by count to keep prompts small
+    chunk_size = 100
+    chunks = [logs[i:i + chunk_size] for i in range(0, len(logs), chunk_size)]
+    analyses: List[Dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks):
+        prompt = (
+            "You are a senior network security analyst. Analyze the following suspicious/malicious network logs.\n"
+            "For each chunk, provide: 1) overall verdict (benign/suspicious/malicious), 2) likely attack technique/threat type, "
+            "3) possible MITRE ATT&CK techniques (IDs and names), 4) short incident response recommendation.\n"
+            "Respond as JSON with keys: summary, verdict, threats, mitre_mapping, recommendations.\n\n"
+            f"LOG CHUNK {idx+1}/{len(chunks)}:\n" + json.dumps(chunk)[:15000]
+        )
+        try:
+            response_text = await gemini_client._generate_response(prompt)  # type: ignore[attr-defined]
+            try:
+                analyses.append(json.loads(response_text))
+            except Exception:
+                analyses.append({
+                    "summary": response_text,
+                    "verdict": "Analysis",
+                    "threats": [],
+                    "mitre_mapping": [],
+                    "recommendations": ["Manual review recommended."]
+                })
+        except Exception as e:
+            logger.error(f"Gemini analysis error: {e}")
+            analyses.append({
+                "summary": "AI analysis unavailable",
+                "verdict": "Unknown",
+                "threats": [],
+                "mitre_mapping": [],
+                "recommendations": ["Manual review recommended."]
+            })
+    return analyses
+
 @app.get("/")
 def read_root():
     return {
-        "message": "Welcome to the CyAi Dashboard API",
+        "message": "Welcome to the CyFort AI API",
         "version": "2.0.0",
         "features": [
             "Pre-trained Log Classifier for network/system logs",
@@ -537,6 +769,298 @@ async def ai_assistant(
     except Exception as e:
         logger.error(f"Error in AI assistant: {e}")
         raise HTTPException(status_code=500, detail=f"AI assistant failed: {str(e)}")
+
+
+@app.post("/analyze-pcap", response_model=PcapAnalysisResponse)
+async def analyze_pcap(
+    file: UploadFile = File(...),
+    model_manager: ModelManager = Depends(get_model_manager),  # reserved for consistency
+    gemini_client: GeminiClient = Depends(get_gemini_client)
+):
+    """Analyze a .pcap or .pcapng file: extract logs, classify with local PyTorch model, and run Gemini deep analysis."""
+    start_time = time.time()
+    if not file.filename.lower().endswith((".pcap", ".pcapng")):
+        raise HTTPException(status_code=400, detail="Only .pcap or .pcapng files are supported")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pcap_"))
+    pcap_path = tmp_dir / file.filename
+    try:
+        content = await file.read()
+        pcap_path.write_bytes(content)
+
+        # Extract logs with tshark
+        logs_path, records = _run_tshark_extract(pcap_path)
+
+        # Classify each record
+        pkt_model = get_packet_model()
+        classified: List[Dict[str, Any]] = []
+        for rec in records:
+            label = "Benign"
+            conf = 0.5
+            if pkt_model is not None and torch is not None:
+                try:
+                    features = _featurize_for_model(rec)
+                    if features is not None:
+                        with torch.no_grad():
+                            output = pkt_model(features)
+                            if isinstance(output, (list, tuple)):
+                                output = output[0]
+                            if hasattr(output, 'softmax'):
+                                probs = output.softmax(dim=-1)
+                            else:
+                                probs = torch.softmax(output, dim=-1)
+                            probs_list = probs.squeeze(0).tolist()
+                            # Map indices 0/1/2 => Benign/Suspicious/Malicious
+                            idx = int(max(range(len(probs_list)), key=lambda i: probs_list[i]))
+                            mapping = {0: "Benign", 1: "Suspicious", 2: "Malicious"}
+                            label = mapping.get(idx, "Benign")
+                            conf = float(probs_list[idx]) if probs_list else 0.5
+                    else:
+                        label, conf = _simple_rule_based_classify(rec)
+                except Exception as ie:
+                    logger.warning(f"Model inference failed, using fallback: {ie}")
+                    label, conf = _simple_rule_based_classify(rec)
+            else:
+                label, conf = _simple_rule_based_classify(rec)
+
+            rec_out = dict(rec)
+            rec_out.update({
+                'classification': label,
+                'confidence': conf
+            })
+            classified.append(rec_out)
+
+        # Filter suspicious/malicious
+        filtered = [r for r in classified if (r.get('classification') or '').lower() in ("suspicious", "malicious")]
+
+        # Compute model summary
+        benign_count = sum(1 for r in classified if (r.get('classification') or '').lower() == 'benign')
+        suspicious_count = sum(1 for r in classified if (r.get('classification') or '').lower() == 'suspicious')
+        malicious_count = sum(1 for r in classified if (r.get('classification') or '').lower() == 'malicious')
+        avg_conf = 0.0
+        if classified:
+            avg_conf = float(sum(float(r.get('confidence') or 0.0) for r in classified) / len(classified))
+        model_summary = {
+            'total_packets': len(records),
+            'benign': benign_count,
+            'suspicious': suspicious_count,
+            'malicious': malicious_count,
+            'avg_confidence': round(avg_conf, 4)
+        }
+
+        if not filtered:
+            return PcapAnalysisResponse(
+                model_summary=model_summary,
+                gemini_analysis=[],
+                final_verdict='Safe',
+                classified_logs=[],
+                recommendations=["Continue monitoring."]
+            )
+
+        # LLM deep analysis
+        analyses = await _analyze_with_gemini(gemini_client, filtered)
+
+        # Build recommendations
+        recs: List[str] = []
+        for a in analyses:
+            if isinstance(a, dict):
+                rx = a.get('recommendations')
+                if isinstance(rx, list):
+                    recs.extend([str(x) for x in rx][:5])
+        if not recs:
+            recs = [
+                "Isolate affected hosts if compromise suspected.",
+                "Block malicious IPs/domains at the perimeter.",
+                "Collect relevant logs and artifacts for IR.",
+            ]
+
+        # Determine final verdict (prioritize Gemini verdicts if present)
+        def verdict_rank(v: str) -> int:
+            vv = (v or '').lower()
+            if vv == 'malicious':
+                return 3
+            if vv == 'suspicious':
+                return 2
+            return 1
+
+        gemini_verdicts: List[str] = []
+        for a in analyses:
+            if isinstance(a, dict):
+                v = a.get('verdict') or a.get('final_label') or a.get('classification')
+                if isinstance(v, str):
+                    gemini_verdicts.append(v)
+        final_verdict = None
+        if gemini_verdicts:
+            final_verdict = max(gemini_verdicts, key=verdict_rank)
+        else:
+            final_verdict = 'Malicious' if malicious_count > 0 else ('Suspicious' if suspicious_count > 0 else 'Safe')
+
+        return PcapAnalysisResponse(
+            model_summary=model_summary,
+            gemini_analysis=analyses,
+            final_verdict=final_verdict,
+            classified_logs=filtered,
+            recommendations=recs[:10]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in PCAP analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"PCAP analysis failed: {str(e)}")
+    finally:
+        # Cleanup
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@app.post("/upload_pcap")
+async def upload_pcap(file: UploadFile = File(...)):
+    """Accept a .pcap or .pcapng, parse basic details, and return a concise summary.
+
+    Response JSON:
+    - total_packets: int
+    - protocol_counts: Dict[str, int]
+    - sample_packets: List[{
+        timestamp, protocol, src_ip, dst_ip, src_port, dst_port
+      }] (first 5)
+    """
+    filename = file.filename or "pcap.pcap"
+    if not filename.lower().endswith((".pcap", ".pcapng")):
+        raise HTTPException(status_code=400, detail="Only .pcap or .pcapng files are supported")
+
+    try:
+        content = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {e}")
+
+    # Size guard (50MB default)
+    if not is_safe_file_size(len(content)):
+        raise HTTPException(status_code=413, detail="File too large. Max 50MB allowed.")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="upload_pcap_"))
+    pcap_path = tmp_dir / filename
+    try:
+        pcap_path.write_bytes(content)
+
+        # Try Scapy first
+        try:
+            from scapy.all import rdpcap, IP, IPv6, TCP, UDP  # type: ignore
+            packets = rdpcap(str(pcap_path))
+            total_packets = len(packets)
+
+            protocol_counts: Dict[str, int] = {}
+            sample_packets: List[Dict[str, Any]] = []
+
+            def detect_protocol(pkt) -> str:
+                try:
+                    if TCP in pkt:
+                        return "TCP"
+                    if UDP in pkt:
+                        return "UDP"
+                    # ICMP/ICMPv6 may not be imported explicitly; identify by layer name
+                    layer_names = {l.name.upper() for l in pkt.layers()}
+                    if "ICMP" in layer_names:
+                        return "ICMP"
+                    if "ICMPV6" in layer_names:
+                        return "ICMPv6"
+                    # Fall back to top-most layer name
+                    try:
+                        return str(pkt.lastlayer().name).upper()
+                    except Exception:
+                        return "OTHER"
+                except Exception:
+                    return "OTHER"
+
+            def get_ips_ports(pkt) -> Dict[str, Any]:
+                src_ip = dst_ip = None
+                src_port = dst_port = None
+                try:
+                    if IP in pkt:
+                        src_ip = pkt[IP].src
+                        dst_ip = pkt[IP].dst
+                    elif IPv6 in pkt:
+                        src_ip = pkt[IPv6].src
+                        dst_ip = pkt[IPv6].dst
+                except Exception:
+                    pass
+                try:
+                    if TCP in pkt:
+                        src_port = int(pkt[TCP].sport)
+                        dst_port = int(pkt[TCP].dport)
+                    elif UDP in pkt:
+                        src_port = int(pkt[UDP].sport)
+                        dst_port = int(pkt[UDP].dport)
+                except Exception:
+                    pass
+                return {
+                    "src_ip": src_ip or "",
+                    "dst_ip": dst_ip or "",
+                    "src_port": src_port,
+                    "dst_port": dst_port,
+                }
+
+            for idx, pkt in enumerate(packets):
+                proto = detect_protocol(pkt)
+                protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
+                if len(sample_packets) < 5:
+                    ts = None
+                    try:
+                        ts = float(getattr(pkt, "time", None))
+                    except Exception:
+                        ts = None
+                    infos = get_ips_ports(pkt)
+                    sample_packets.append({
+                        "timestamp": ts,
+                        "protocol": proto,
+                        **infos,
+                    })
+
+            return {
+                "total_packets": total_packets,
+                "protocol_counts": dict(sorted(protocol_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+                "sample_packets": sample_packets,
+            }
+        except Exception as scapy_err:
+            # As a fallback, attempt tshark-based extraction if available via existing helper
+            try:
+                _, records = _run_tshark_extract(pcap_path)
+                total_packets = len(records)
+                protocol_counts: Dict[str, int] = {}
+                for r in records:
+                    proto = (r.get("protocol") or "OTHER").upper()
+                    protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
+                sample = []
+                for r in records[:5]:
+                    # Attempt to parse numeric timestamp
+                    ts_raw = r.get("timestamp")
+                    try:
+                        ts = float(ts_raw)
+                    except Exception:
+                        ts = None
+                    sample.append({
+                        "timestamp": ts,
+                        "protocol": (r.get("protocol") or "").upper(),
+                        "src_ip": r.get("src_ip") or "",
+                        "dst_ip": r.get("dst_ip") or "",
+                        "src_port": None,
+                        "dst_port": None,
+                    })
+                return {
+                    "total_packets": total_packets,
+                    "protocol_counts": dict(sorted(protocol_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+                    "sample_packets": sample,
+                }
+            except Exception as tshark_err:
+                raise HTTPException(status_code=500, detail=f"Failed to parse PCAP (Scapy: {scapy_err}; tshark: {tshark_err})")
+    finally:
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 @app.get("/models/status")
 async def get_models_status(model_manager: ModelManager = Depends(get_model_manager)):

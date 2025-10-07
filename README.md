@@ -1,4 +1,4 @@
-# CyAi Dashboard
+# CyFort AI
 
 AI-powered cybersecurity analysis platform providing log analysis, URL phishing detection, malware file scanning, and an AI assistant augmented by Gemini-1.5-Pro. The system includes a FastAPI backend with pre-trained model modules and a Streamlit frontend.
 
@@ -22,7 +22,7 @@ AI-powered cybersecurity analysis platform providing log analysis, URL phishing 
 - Roadmap
 
 ## Overview
-CyAi Dashboard enables analysts to:
+CyFort AI enables analysts to:
 - Classify and label logs with AI explanations
 - Detect phishing risks for URLs with a multi-stage pipeline and an AI-driven final verdict
 - Scan uploaded files for malware indicators and families

@@ -5,7 +5,7 @@ from datetime import datetime
 import os
 
 # Centralized backend URL and request helpers
-API_BASE = os.getenv('CYAI_API_BASE', 'http://localhost:8000')
+API_BASE = os.getenv('CYFORT_API_BASE', os.getenv('CYAI_API_BASE', 'http://localhost:8000'))
 
 def api_get(path: str, timeout: int = 5):
     try:
@@ -35,7 +35,7 @@ def api_post(path: str, *, json: dict | None = None, files=None, data=None, time
 
 # Page configuration
 st.set_page_config(
-    page_title="CyAi Dashboard",
+    page_title="CyFort AI",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -117,13 +117,13 @@ st.markdown("""
 # Main header
 st.markdown("""
 <div class="page-header">
-    <h1>🛡️ CyAi Dashboard</h1>
+    <h1>🛡️ CyFort AI</h1>
     <p>AI-Powered Cybersecurity Analysis Platform</p>
 </div>
 """, unsafe_allow_html=True)
 
 # Sidebar navigation
-st.sidebar.title("🛡️ CyAi Dashboard")
+st.sidebar.title("🛡️ CyFort AI")
 st.sidebar.markdown("---")
 
 # Check backend status
@@ -158,73 +158,62 @@ col4.metric("AI Queries", "0")
 # Main content based on page selection
 if page == "📊 Log Analyzer":
     st.markdown("## 📊 Log Analyzer")
-    st.markdown("Paste logs to get classification results with AI explanations")
-    
-    # Log input
-    log_data = st.text_area(
-        "Enter log data:",
-        placeholder="Paste your log entries here...\nExample:\n2024-01-15 10:30:45 192.168.1.100 -> 10.0.0.1 TCP Connection established\n2024-01-15 10:31:00 192.168.1.101 -> 8.8.8.8 DNS Query for malicious.com",
-        height=200
+    st.markdown("Upload a .pcap or .pcapng to view a quick summary of its contents")
+
+    uploaded_pcap = st.file_uploader(
+        "Choose a PCAP file:",
+        type=["pcap", "pcapng"],
+        help="Upload a packet capture file for basic analysis"
     )
-    
-    log_type = st.selectbox("Log Type:", ["network", "system", "application"])
-    
-    if st.button("🔍 Analyze Logs") and log_data:
+
+    if uploaded_pcap and st.button("🔍 Analyze"):
         try:
-            # Prepare request
-            logs = [line.strip() for line in log_data.split('\n') if line.strip()]
-            request_data = {
-                "logs": logs,
-                "log_type": log_type
-            }
-            
-            with st.spinner("Analyzing logs with AI..."):
-                response, err = api_post("/analyze-logs", json=request_data)
-            
+            files = {"file": (uploaded_pcap.name, uploaded_pcap, "application/octet-stream")}
+            with st.spinner("Analyzing PCAP..."):
+                response, err = api_post("/upload_pcap", files=files, timeout=120)
+
             if response and response.status_code == 200:
-                results = response.json()
-                
-                st.markdown("### 🔍 Analysis Results")
-                
-                for i, result in enumerate(results):
-                    with st.expander(f"Log Entry {i+1}: {logs[i][:50]}..."):
-                        classification = result.get("classification", "Unknown")
-                        confidence = result.get("confidence", 0)
-                        threat_level = result.get("threat_level", "Low")
-                        
-                        if classification == "Malicious":
-                            st.markdown(f'<div class="status-malicious">🚨 {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
-                        elif classification == "Suspicious":
-                            st.markdown(f'<div class="status-suspicious">⚠️ {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
-                        else:
-                            st.markdown(f'<div class="status-safe">✅ {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
-                        
-                        st.markdown("### 📊 Model Output")
-                        st.markdown(f"""
-                        <div class="model-output">
-                            <strong>Classification:</strong> {classification}<br>
-                            <strong>Confidence:</strong> {confidence:.2%}<br>
-                            <strong>Threat Level:</strong> {threat_level}<br>
-                            <strong>Labels:</strong> {', '.join(result.get('metadata', {}).get('labels', []))}
-                        </div>
-                        """, unsafe_allow_html=True)
-                        
-                        st.markdown("### 🤖 AI Explanation")
-                        explanation = result.get("explanation", "No explanation available")
-                        st.markdown(f"""
-                        <div class="ai-explanation">
-                            {explanation}
-                        </div>
-                        """, unsafe_allow_html=True)
-                        
-                        recommended_action = result.get("recommended_action", "")
-                        if recommended_action:
-                            st.markdown("### 📋 Recommended Action")
-                            st.info(recommended_action)
+                result = response.json()
+                total_packets = result.get("total_packets", 0)
+                protocol_counts = result.get("protocol_counts", {})
+                sample_packets = result.get("sample_packets", [])
+
+                st.markdown("### 📊 Summary")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Packets", f"{total_packets}")
+                with col2:
+                    st.markdown("**Top Protocols**")
+                    if protocol_counts:
+                        # Show top 5 protocols
+                        items = list(protocol_counts.items())[:5]
+                        for proto, count in items:
+                            st.write(f"- {proto}: {count}")
+                    else:
+                        st.write("No protocols detected")
+
+                st.markdown("### 🔍 Sample Packets (first 5)")
+                if sample_packets:
+                    for i, pkt in enumerate(sample_packets, 1):
+                        ts = pkt.get("timestamp")
+                        proto = pkt.get("protocol", "")
+                        src_ip = pkt.get("src_ip", "")
+                        dst_ip = pkt.get("dst_ip", "")
+                        src_port = pkt.get("src_port")
+                        dst_port = pkt.get("dst_port")
+                        with st.expander(f"Packet {i}: {proto} {src_ip}:{src_port or ''} -> {dst_ip}:{dst_port or ''}"):
+                            st.json(pkt)
+                else:
+                    st.info("No packets to display.")
             else:
-                st.error(f"Backend error: {response.json().get('detail', 'Unknown error') if response else err}")
+                try:
+                    detail = response.json().get('detail', 'Unknown error') if response else err
+                except Exception:
+                    detail = err or (response.text if response else 'Unknown error')
+                st.error(f"Backend error: {detail}")
         except Exception as e:
             st.error(f"Error: {str(e)}")
+
 
 elif page == "🔗 URL Checker":
     st.markdown("## 🔗 URL Checker")
@@ -310,6 +299,12 @@ elif page == "🔗 URL Checker":
                     <strong>Explanation:</strong> {final_expl}
                 </div>
                 """, unsafe_allow_html=True)
+
+                # Summary comparison section
+                st.markdown("### 📊 Summary")
+                st.markdown(f"- **Model**: {model_section.get('label', 'Unknown')} (score: {model_section.get('score', 0):.2f})")
+                st.markdown(f"- **VirusTotal**: {vt_section.get('verdict', 'Unknown')} (detections: {vt_section.get('detections', 0)})")
+                st.markdown(f"- **Final**: {final_label} ({final_threat})")
 
                 # Notes/Insights section
                 st.markdown("### 📝 Notes / Insights")

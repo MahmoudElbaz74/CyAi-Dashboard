@@ -1,5 +1,5 @@
 """
-Logging utility functions for CyAi Dashboard
+Logging utility functions for CyFort AI
 Handles logging configuration and analysis result logging
 """
 

@@ -1,5 +1,5 @@
 """
-Utils package for CyAi Dashboard
+Utils package for CyFort AI
 Contains helper functions and utilities
 """
 

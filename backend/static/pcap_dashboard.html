@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CyFort AI - PCAP Analysis</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; color: #111; }
+    h1 { margin-top: 0; }
+    .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+    .btn { background: #111827; color: #fff; padding: 10px 14px; border: 0; border-radius: 6px; cursor: pointer; }
+    .btn:disabled { background: #6b7280; cursor: not-allowed; }
+    pre { background: #0b1020; color: #d1d5db; padding: 12px; border-radius: 8px; overflow: auto; max-height: 400px; }
+    .muted { color: #6b7280; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .pill.safe { background: #dcfce7; color: #065f46; }
+    .pill.suspicious { background: #fef3c7; color: #92400e; }
+    .pill.malicious { background: #fee2e2; color: #991b1b; }
+    details summary { cursor: pointer; }
+    canvas { max-width: 100%; }
+  </style>
+  <link rel="icon" href="data:," />
+  <meta http-equiv="Cache-Control" content="no-store" />
+</head>
+<body>
+  <h1>CyFort AI - PCAP Analysis</h1>
+  <div class="card">
+    <label for="fileInput"><strong>Upload .pcap or .pcapng</strong></label><br />
+    <input id="fileInput" type="file" accept=".pcap,.pcapng" />
+    <button id="analyzeBtn" class="btn" disabled>Analyze</button>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>📊 Model Analysis Summary</h3>
+      <div id="modelSummary"><span class="muted">No data yet.</span></div>
+      <canvas id="summaryChart" width="300" height="300"></canvas>
+    </div>
+    <div class="card">
+      <h3>🧠 Gemini Threat Report</h3>
+      <details>
+        <summary>Show/Hide Analysis</summary>
+        <pre id="geminiReport">No data yet.</pre>
+      </details>
+    </div>
+    <div class="card">
+      <h3>✅ Final Verdict</h3>
+      <div id="finalVerdict"><span class="muted">No data yet.</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Download Report</h3>
+    <button id="downloadJsonBtn" class="btn" disabled>Download JSON</button>
+    <button id="downloadPdfBtn" class="btn" disabled>Download PDF</button>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const statusEl = document.getElementById('status');
+    const modelSummaryEl = document.getElementById('modelSummary');
+    const geminiReportEl = document.getElementById('geminiReport');
+    const finalVerdictEl = document.getElementById('finalVerdict');
+    const downloadJsonBtn = document.getElementById('downloadJsonBtn');
+    const downloadPdfBtn = document.getElementById('downloadPdfBtn');
+    const chartCanvas = document.getElementById('summaryChart');
+
+    let lastReport = null;
+
+    fileInput.addEventListener('change', () => {
+      analyzeBtn.disabled = !fileInput.files || fileInput.files.length === 0;
+    });
+
+    analyzeBtn.addEventListener('click', async () => {
+      if (!fileInput.files || fileInput.files.length === 0) return;
+      const file = fileInput.files[0];
+      statusEl.textContent = ' Uploading and analyzing...';
+      analyzeBtn.disabled = true;
+      try {
+        const form = new FormData();
+        form.append('file', file);
+        const resp = await fetch('/analyze-pcap', { method: 'POST', body: form });
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(text || 'Request failed');
+        }
+        const data = await resp.json();
+        lastReport = data;
+        renderReport(data);
+        statusEl.textContent = ' Done.';
+        downloadJsonBtn.disabled = false;
+        downloadPdfBtn.disabled = false;
+      } catch (e) {
+        statusEl.textContent = ' Error: ' + e.message;
+      } finally {
+        analyzeBtn.disabled = false;
+      }
+    });
+
+    function renderReport(data) {
+      const ms = data.model_summary || {};
+      modelSummaryEl.innerHTML = `
+        <div>Total Packets: <strong>${ms.total_packets ?? 0}</strong></div>
+        <div>Safe: <strong>${ms.benign ?? 0}</strong></div>
+        <div>Suspicious: <strong>${ms.suspicious ?? 0}</strong></div>
+        <div>Malicious: <strong>${ms.malicious ?? 0}</strong></div>
+        <div>Avg Confidence: <strong>${ms.avg_confidence ?? 0}</strong></div>
+      `;
+      renderChart(ms);
+
+      const verdict = (data.final_verdict || 'Safe').toLowerCase();
+      finalVerdictEl.innerHTML = `<span class="pill ${verdict}">${data.final_verdict || 'Safe'}</span>`;
+
+      try {
+        geminiReportEl.textContent = JSON.stringify(data.gemini_analysis || [], null, 2);
+      } catch {
+        geminiReportEl.textContent = 'Unable to render analysis.';
+      }
+    }
+
+    function renderChart(ms) {
+      if (!chartCanvas) return;
+      const ctx = chartCanvas.getContext('2d');
+      const values = [ms.benign || 0, ms.suspicious || 0, ms.malicious || 0];
+      const colors = ['#22c55e', '#f59e0b', '#ef4444'];
+      const labels = ['Safe', 'Suspicious', 'Malicious'];
+      const total = values.reduce((a, b) => a + b, 0) || 1;
+      const cx = chartCanvas.width / 2;
+      const cy = chartCanvas.height / 2;
+      const radius = Math.min(cx, cy) - 10;
+      let startAngle = -Math.PI / 2;
+      ctx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
+      values.forEach((val, i) => {
+        const slice = (val / total) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, radius, startAngle, startAngle + slice);
+        ctx.closePath();
+        ctx.fillStyle = colors[i];
+        ctx.fill();
+        startAngle += slice;
+      });
+      ctx.font = '12px system-ui';
+      labels.forEach((label, i) => {
+        ctx.fillStyle = colors[i];
+        ctx.fillRect(10, 10 + i * 18, 12, 12);
+        ctx.fillStyle = '#111827';
+        ctx.fillText(`${label}: ${values[i]}`, 28, 20 + i * 18);
+      });
+    }
+
+    downloadJsonBtn.addEventListener('click', () => {
+      if (!lastReport) return;
+      const blob = new Blob([JSON.stringify(lastReport, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'cyfort_pcap_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    });
+
+    downloadPdfBtn.addEventListener('click', async () => {
+      if (!lastReport) return;
+      const w = window.open('', '_blank');
+      if (!w) return;
+      w.document.write(`<pre>${escapeHtml(JSON.stringify(lastReport, null, 2))}</pre>`);
+      w.document.close();
+      w.focus();
+      w.print();
+    });
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+  </script>
+</body>
+</html>
+
+
