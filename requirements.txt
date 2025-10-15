@@ -2,13 +2,13 @@ fastapi==0.115.2
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
 requests==2.32.3
+httpx>=0.24.0
 python-dotenv==1.0.1
 tensorflow==2.20.0
 numpy
 pandas==2.2.3
 # scikit-learn==1.5.2
-keras==3.4.1
-tokenizers==0.19.1
+#tokenizers==0.19.1
 google-generativeai==0.8.3
 streamlit==1.38.0
 plotly==5.24.1
@@ -17,4 +17,9 @@ seaborn==0.13.2
 joblib==1.4.2
 tqdm==4.66.5
 python-multipart==0.0.9
+# PyTorch and Lightning for Xception model
+torch>=1.9.0
+torchvision>=0.10.0
+pytorch-lightning>=1.5.0
+Pillow>=8.0.0
 # yara-python==4.5.2

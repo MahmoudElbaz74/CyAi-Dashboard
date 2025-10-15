@@ -20,7 +20,7 @@ def api_get(path: str, timeout: int = 5):
             pass
         return None, detail or str(e)
 
-def api_post(path: str, *, json: dict | None = None, files=None, data=None, timeout: int = 30):
+def api_post(path: str, *, json: dict | None = None, files=None, data=None, timeout: int = 120):
     try:
         resp = requests.post(f"{API_BASE}{path}", json=json, files=files, data=data, timeout=timeout)
         return resp, None
@@ -155,64 +155,103 @@ col3, col4 = st.sidebar.columns(2)
 col3.metric("Files Scanned", "0")
 col4.metric("AI Queries", "0")
 
+# helper renderer (keep in the same file)
+def render_result(result):
+    classification = result.get("classification", "Unknown")
+    confidence = result.get("confidence", 0)
+    labels = result.get("labels", []) or []
+    details = result.get("details", {}) or {}
+    log_type = result.get("log_type", "N/A")
+
+    # Status display
+    if classification == "Malicious":
+        st.markdown(f'<div class="status-malicious">🚨 {classification}</div>', unsafe_allow_html=True)
+    elif classification == "Suspicious":
+        st.markdown(f'<div class="status-suspicious">⚠️ {classification}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="status-safe">✅ {classification}</div>', unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="model-output">
+        <strong>Log Type:</strong> {log_type}<br>
+        <strong>Confidence:</strong> {confidence:.2%}<br>
+        <strong>Labels:</strong> {", ".join(labels)}<br>
+        <strong>Details:</strong> {json.dumps(details, indent=2)}
+    </div>
+    """, unsafe_allow_html=True)
+
 # Main content based on page selection
 if page == "📊 Log Analyzer":
     st.markdown("## 📊 Log Analyzer")
-    st.markdown("Upload a .pcap or .pcapng to view a quick summary of its contents")
+    st.markdown("Upload a .pcap/.pcapng or a log file (.csv/.txt) to analyze")
 
-    uploaded_pcap = st.file_uploader(
-        "Choose a PCAP file:",
-        type=["pcap", "pcapng"],
-        help="Upload a packet capture file for basic analysis"
-    )
+    tab_pcap, tab_logs = st.tabs(["📁 PCAP Analysis", "🧾 Log File Analysis"])
 
-    if uploaded_pcap and st.button("🔍 Analyze"):
-        try:
-            files = {"file": (uploaded_pcap.name, uploaded_pcap, "application/octet-stream")}
-            with st.spinner("Analyzing PCAP..."):
-                response, err = api_post("/upload_pcap", files=files, timeout=120)
+    with tab_pcap:
+        uploaded_pcap = st.file_uploader(
+            "Choose a PCAP file:",
+            type=["pcap", "pcapng"],
+            help="Upload a packet capture file for basic analysis",
+            key="pcap_file"  # unique key added
+        )
 
-            if response and response.status_code == 200:
-                result = response.json()
-                total_packets = result.get("total_packets", 0)
-                protocol_counts = result.get("protocol_counts", {})
-                sample_packets = result.get("sample_packets", [])
+        if uploaded_pcap:
+            st.info("PCAP uploaded — basic summary below.")
+            st.write({"filename": uploaded_pcap.name, "size_bytes": uploaded_pcap.size})
 
-                st.markdown("### 📊 Summary")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Total Packets", f"{total_packets}")
-                with col2:
-                    st.markdown("**Top Protocols**")
-                    if protocol_counts:
-                        # Show top 5 protocols
-                        items = list(protocol_counts.items())[:5]
-                        for proto, count in items:
-                            st.write(f"- {proto}: {count}")
-                    else:
-                        st.write("No protocols detected")
+    with tab_logs:
+        uploaded_log = st.file_uploader(
+            "Choose a log file:",
+            type=["csv", "txt"],
+            help="Upload a system/network log file for AI analysis",
+            key="log_file"  # unique key added
+        )
 
-                st.markdown("### 🔍 Sample Packets (first 5)")
-                if sample_packets:
-                    for i, pkt in enumerate(sample_packets, 1):
-                        ts = pkt.get("timestamp")
-                        proto = pkt.get("protocol", "")
-                        src_ip = pkt.get("src_ip", "")
-                        dst_ip = pkt.get("dst_ip", "")
-                        src_port = pkt.get("src_port")
-                        dst_port = pkt.get("dst_port")
-                        with st.expander(f"Packet {i}: {proto} {src_ip}:{src_port or ''} -> {dst_ip}:{dst_port or ''}"):
-                            st.json(pkt)
+        if uploaded_log and st.button("🔍 Analyze Logs"):
+            try:
+                text_data = uploaded_log.read().decode("utf-8", errors="ignore")
+                if not text_data.strip():
+                    st.warning("Uploaded log file is empty or unreadable.")
                 else:
-                    st.info("No packets to display.")
-            else:
-                try:
-                    detail = response.json().get('detail', 'Unknown error') if response else err
-                except Exception:
-                    detail = err or (response.text if response else 'Unknown error')
-                st.error(f"Backend error: {detail}")
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+                    log_lines = [line.strip() for line in text_data.splitlines() if line.strip()]
+
+                    payload = {
+                        "log_entries": log_lines,
+                        "log_type": "network",
+                        "include_confidence": True
+                    }
+
+                    with st.spinner("Analyzing logs using AI model..."):
+                        response, err = api_post("/analyze-logs", json=payload, timeout=120)
+
+                    if err:
+                        st.error(f"Request failed: {err}")
+                    elif not response:
+                        st.error("No response from backend")
+                    elif response.status_code != 200:
+                        # try to extract detail
+                        try:
+                            detail = response.json().get('detail', response.text)
+                        except Exception:
+                            detail = response.text
+                        st.error(f"Backend error: {detail}")
+                    else:
+                        result = response.json()
+
+                        # result expected to be a list of items, but support single-object too
+                        if isinstance(result, list):
+                            st.markdown("### 🧾 Batch Log Analysis Results")
+                            for i, log_result in enumerate(result, 1):
+                                render_result(log_result)
+                                if i < len(result):
+                                    st.markdown("---")
+                        else:
+                            st.markdown("### 🧠 AI Log Classification Result")
+                            render_result(result)
+
+            except Exception as e:
+                st.error(f"Error during log analysis: {str(e)}")
+
 
 
 elif page == "🔗 URL Checker":
@@ -340,7 +379,7 @@ elif page == "🔗 URL Checker":
 
 elif page == "🦠 File Scanner":
     st.markdown("## 🦠 File Scanner")
-    st.markdown("Upload files to scan for malware with AI explanations")
+    st.markdown("Upload files to scan for malware using local Xception model and VirusTotal")
     
     uploaded_file = st.file_uploader(
         "Choose a file to scan:",
@@ -348,73 +387,145 @@ elif page == "🦠 File Scanner":
         help="Upload a file to scan for malware"
     )
     
-    col1, col2 = st.columns(2)
-    with col1:
-        scan_type = st.selectbox("Scan Type:", ["quick", "deep", "full"])
-    with col2:
-        include_family = st.checkbox("Include malware family detection", value=True)
-    
     if uploaded_file and st.button("🔍 Scan File"):
         try:
-            files = {"file": (uploaded_file.name, uploaded_file, "application/octet-stream")}
-            data = {
-                "scan_type": scan_type,
-                "include_family_detection": include_family
-            }
-            
-            with st.spinner("Scanning file with AI..."):
-                response, err = api_post("/analyze-file", files=files, data=data)
-            
-            if response and response.status_code == 200:
-                result = response.json()
+            with st.spinner("Scanning file with local model and VirusTotal..."):
+                # Try comprehensive scan first
+                files = {"file": (uploaded_file.name, uploaded_file, "application/octet-stream")}
+                response, err = api_post("/scan-file-comprehensive", files=files)
                 
-                st.markdown("### 🔍 Analysis Results")
-                
-                classification = result.get("classification", "Unknown")
-                confidence = result.get("confidence", 0)
-                threat_level = result.get("threat_level", "Low")
-                malware_family = result.get("malware_family")
-                
-                if classification == "Malicious":
-                    st.markdown(f'<div class="status-malicious">🚨 {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
-                elif classification == "Suspicious":
-                    st.markdown(f'<div class="status-suspicious">⚠️ {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                if response and response.status_code == 200:
+                    results = response.json()
+                    
+                    # Local Model Results
+                    st.markdown("### 🧠 Local Model Scan")
+                    local_model = results.get("local_model", {})
+                    
+                    if local_model.get("success"):
+                        predicted_class = local_model.get("predicted_class", "Unknown")
+                        confidence = local_model.get("confidence", 0)
+                        threat_level = local_model.get("threat_level", "Low")
+                        file_name = local_model.get("file_name", uploaded_file.name)
+                        file_size = local_model.get("file_size", uploaded_file.size)
+                        
+                        # Display results
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            if predicted_class == "Malicious":
+                                st.markdown(f'<div class="status-malicious">🚨 {predicted_class} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                            else:
+                                st.markdown(f'<div class="status-safe">✅ {predicted_class} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                        
+                        with col2:
+                            st.metric("Confidence", f"{confidence:.1%}")
+                        
+                        # Model details
+                        st.markdown(f"""
+                        <div class="model-output">
+                            <strong>Predicted Class:</strong> {predicted_class}<br>
+                            <strong>Confidence Score:</strong> {confidence:.2%}<br>
+                            <strong>Threat Level:</strong> {threat_level}<br>
+                            <strong>File Name:</strong> {file_name}<br>
+                            <strong>File Size:</strong> {file_size:,} bytes
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.error(f"Local model scan failed: {local_model.get('error', 'Unknown error')}")
+                    
+                    # VirusTotal Results
+                    st.markdown("### 🛡️ VirusTotal Scan")
+                    virustotal = results.get("virustotal", {})
+                    
+                    if virustotal.get("success"):
+                        malicious = virustotal.get("malicious", 0)
+                        suspicious = virustotal.get("suspicious", 0)
+                        undetected = virustotal.get("undetected", 0)
+                        harmless = virustotal.get("harmless", 0)
+                        
+                        # Display VirusTotal results in a clean layout
+                        st.markdown("#### VirusTotal Engine Results")
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("🚨 Malicious", malicious, delta=None)
+                        with col2:
+                            st.metric("⚠️ Suspicious", suspicious, delta=None)
+                        with col3:
+                            st.metric("✅ Harmless", harmless, delta=None)
+                        with col4:
+                            st.metric("❓ Undetected", undetected, delta=None)
+                        
+                        # Overall VirusTotal verdict
+                        if malicious > 0:
+                            vt_verdict = "🚨 Malicious"
+                            vt_color = "red"
+                        elif suspicious > 0:
+                            vt_verdict = "⚠️ Suspicious"
+                            vt_color = "orange"
+                        elif harmless > 0:
+                            vt_verdict = "✅ Clean"
+                            vt_color = "green"
+                        else:
+                            vt_verdict = "❓ Unknown"
+                            vt_color = "gray"
+                        
+                        st.markdown(f"**VirusTotal Verdict:** <span style='color: {vt_color}'>{vt_verdict}</span>", unsafe_allow_html=True)
+                        
+                    else:
+                        error_msg = virustotal.get('error', 'Unknown error')
+                        if "timeout" in error_msg.lower():
+                            st.warning(f"⏱️ VirusTotal scan timeout: {error_msg}")
+                            st.info("💡 **Tip**: VirusTotal analysis can take up to 60 seconds for larger files. You can try again later or check the VirusTotal website directly.")
+                        else:
+                            st.warning(f"VirusTotal scan failed: {error_msg}")
+                        
                 else:
-                    st.markdown(f'<div class="status-safe">✅ {classification} - {threat_level} Threat</div>', unsafe_allow_html=True)
-                
-                st.markdown("### 📊 Model Output")
-                st.markdown(f"""
-                <div class="model-output">
-                    <strong>Classification:</strong> {classification}<br>
-                    <strong>Confidence:</strong> {confidence:.2%}<br>
-                    <strong>Threat Level:</strong> {threat_level}<br>
-                    <strong>Malware Family:</strong> {malware_family or 'None detected'}<br>
-                    <strong>File Name:</strong> {uploaded_file.name}<br>
-                    <strong>File Size:</strong> {uploaded_file.size} bytes
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.markdown("### 🤖 AI Explanation")
-                explanation = result.get("explanation", "No explanation available")
-                st.markdown(f"""
-                <div class="ai-explanation">
-                    {explanation}
-                </div>
-                """, unsafe_allow_html=True)
-                
-                recommended_action = result.get("recommended_action", "")
-                if recommended_action:
-                    st.markdown("### 📋 Recommended Action")
-                    st.info(recommended_action)
-                
-                file_info = result.get("file_info", {})
-                if file_info:
-                    with st.expander("📊 File Analysis Details"):
-                        st.json(file_info)
-            else:
-                st.error(f"Backend error: {response.json().get('detail', 'Unknown error') if response else err}")
+                    # Fallback to local model only if comprehensive scan fails
+                    st.warning("Comprehensive scan failed, trying local model only...")
+                    response, err = api_post("/scan-file-local", files=files)
+                    
+                    if response and response.status_code == 200:
+                        result = response.json()
+                        
+                        if result.get("success"):
+                            st.markdown("### 🧠 Local Model Scan")
+                            
+                            predicted_class = result.get("predicted_class", "Unknown")
+                            confidence = result.get("confidence", 0)
+                            threat_level = result.get("threat_level", "Low")
+                            file_name = result.get("file_name", uploaded_file.name)
+                            file_size = result.get("file_size", uploaded_file.size)
+                            
+                            # Display results
+                            col1, col2 = st.columns([2, 1])
+                            with col1:
+                                if predicted_class == "Malicious":
+                                    st.markdown(f'<div class="status-malicious">🚨 {predicted_class} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f'<div class="status-safe">✅ {predicted_class} - {threat_level} Threat</div>', unsafe_allow_html=True)
+                            
+                            with col2:
+                                st.metric("Confidence", f"{confidence:.1%}")
+                            
+                            # Model details
+                            st.markdown(f"""
+                            <div class="model-output">
+                                <strong>Predicted Class:</strong> {predicted_class}<br>
+                                <strong>Confidence Score:</strong> {confidence:.2%}<br>
+                                <strong>Threat Level:</strong> {threat_level}<br>
+                                <strong>File Name:</strong> {file_name}<br>
+                                <strong>File Size:</strong> {file_size:,} bytes
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            st.info("ℹ️ Only local model results available (VirusTotal scan unavailable)")
+                        else:
+                            st.error(f"Local model scan failed: {result.get('error', 'Unknown error')}")
+                    else:
+                        st.error(f"Backend error: {response.json().get('detail', 'Unknown error') if response else err}")
+                    
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"Scanning error: {str(e)}")
 
 else:  # AI Assistant
     st.markdown("## 🤖 AI Assistant")

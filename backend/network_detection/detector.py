@@ -2,11 +2,6 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import logging
-import sys
-import os
-
-# Add the backend directory to the path to import models
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.model_manager import get_model_manager, ModelManager
 from models.log_classifier import LogClassificationRequest, LogClassificationResponse
@@ -25,8 +20,8 @@ class DetectionResult(BaseModel):
     is_malicious: bool
     confidence_score: float
     classification: str
-    labels: List[str]
-    analysis_details: Dict[str, Any]
+    labels: Optional[List[str]] = []
+    analysis_details: Optional[Dict[str, Any]] = {}
 
 class NetworkLogData(BaseModel):
     log_entries: List[str]
@@ -35,7 +30,6 @@ class NetworkLogData(BaseModel):
 
 # Dependency injection
 def get_model_manager_dependency() -> ModelManager:
-    """Dependency to get model manager"""
     return get_model_manager()
 
 @router.post("/detect", response_model=DetectionResult)
@@ -43,36 +37,26 @@ async def detect_traffic(
     data: TrafficData,
     model_manager: ModelManager = Depends(get_model_manager_dependency)
 ):
-    """
-    Detect malicious traffic using pre-trained log classifier model
-    
-    Args:
-        data: Traffic data to analyze
-        model_manager: Model manager dependency
-        
-    Returns:
-        Detection result with classification
-    """
+    # Use fixed default log_type = 'network' (TrafficData doesn't contain log_type)
     try:
-        # Convert traffic data to log format for classification
         log_entry = f"{data.timestamp or 'N/A'} {data.source_ip} -> {data.destination_ip} {data.protocol} {data.payload}"
-        
-        # Create log classification request
+
         log_request = LogClassificationRequest(
             log_data=log_entry,
-            log_type=data.log_type or "network",
+            log_type="network",
             include_confidence=True
         )
-        
-        # Get log classifier model
+
         log_classifier = model_manager.get_log_classifier()
-        
-        # Classify the log
+
+        # ensure model loaded or use heuristic fallback explicitly
+        if not getattr(log_classifier, 'model', None) and not getattr(log_classifier, 'feature_names', None):
+            raise HTTPException(status_code=500, detail="Log classification model not loaded on server")
+
         classification_result = log_classifier.classify_log(log_request)
-        
-        # Convert classification to detection result
+
         is_malicious = classification_result.classification in ["Suspicious", "Malicious"]
-        
+
         return DetectionResult(
             is_malicious=is_malicious,
             confidence_score=classification_result.confidence,
@@ -87,31 +71,26 @@ async def detect_traffic(
                 }
             }
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in traffic detection: {e}")
+        logger.error(f"Error in traffic detection: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Traffic detection failed: {str(e)}")
 
-@router.post("/classify-logs", response_model=List[LogClassificationResponse])
+@router.post("/analyze-logs", response_model=List[LogClassificationResponse])
 async def classify_network_logs(
     log_data: NetworkLogData,
     model_manager: ModelManager = Depends(get_model_manager_dependency)
 ):
-    """
-    Classify multiple network log entries using pre-trained model
-    
-    Args:
-        log_data: Network log data to classify
-        model_manager: Model manager dependency
-        
-    Returns:
-        List of classification results
-    """
     try:
-        # Get log classifier model
         log_classifier = model_manager.get_log_classifier()
-        
-        # Create classification requests for each log entry
+
+        # Prevent silent failure if model loading failed unexpectedly
+        if log_classifier is None:
+            raise HTTPException(status_code=500, detail="Log classifier unavailable")
+
+        # Build requests
         log_requests = [
             LogClassificationRequest(
                 log_data=log_entry,
@@ -120,29 +99,26 @@ async def classify_network_logs(
             )
             for log_entry in log_data.log_entries
         ]
-        
-        # Classify all logs in batch
+
         results = log_classifier.classify_batch(log_requests)
-        
+
+        # Always return a list for consistency
         return results
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in log classification: {e}")
+        logger.error(f"Error in log classification: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Log classification failed: {str(e)}")
 
 @router.get("/model-info")
 async def get_network_detection_model_info(
     model_manager: ModelManager = Depends(get_model_manager_dependency)
 ):
-    """
-    Get information about the network detection model
-    
-    Returns:
-        Model information
-    """
     try:
         log_classifier = model_manager.get_log_classifier()
-        return log_classifier.get_model_info()
+        info = log_classifier.get_model_info() if log_classifier else {}
+        return {"model_info": info}
     except Exception as e:
-        logger.error(f"Error getting model info: {e}")
+        logger.error(f"Error getting model info: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get model info: {str(e)}")

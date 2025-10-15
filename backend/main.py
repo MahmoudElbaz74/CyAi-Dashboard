@@ -14,6 +14,7 @@ import json
 import shutil
 from pathlib import Path
 import math
+import requests
 try:
     import torch  # type: ignore
 except Exception:  # pragma: no cover
@@ -29,6 +30,8 @@ from utils.logging_utils import setup_logging, log_analysis_result
 from utils.validation_utils import validate_model_input
 from utils.file_utils import get_file_metadata, is_safe_file_size
 from fastapi.staticfiles import StaticFiles
+from malware_analysis.analyzer import router as malware_router
+from backend.models import logs_scan
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +47,11 @@ static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+# Include routers
+app.include_router(malware_router, prefix="/malware", tags=["malware"])
+app.include_router(logs_scan.router)
+
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -53,6 +61,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Global model manager instance
 _model_manager = None
@@ -73,6 +82,20 @@ async def startup_event():
         # Log model status
         models_info = _model_manager.get_all_models_info()
         logger.info(f"📊 Model status: {models_info['status']}")
+        
+        # Test VirusTotal API connectivity
+        try:
+            from utils.virustotal_utils import VirusTotalScanner
+            scanner = VirusTotalScanner()
+            connectivity_result = await scanner.test_connectivity()
+            
+            if connectivity_result.get("success"):
+                logger.info("🔗 VirusTotal API: Connected and ready")
+            else:
+                logger.warning(f"⚠️ VirusTotal API: {connectivity_result.get('error', 'Connection failed')}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ VirusTotal API connectivity test failed: {e}")
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize models: {e}")
@@ -796,7 +819,7 @@ async def analyze_pcap(
         classified: List[Dict[str, Any]] = []
         for rec in records:
             label = "Benign"
-            conf = 0.5
+            conf = 0.6  # Default confidence for benign classification
             if pkt_model is not None and torch is not None:
                 try:
                     features = _featurize_for_model(rec)
@@ -814,7 +837,7 @@ async def analyze_pcap(
                             idx = int(max(range(len(probs_list)), key=lambda i: probs_list[i]))
                             mapping = {0: "Benign", 1: "Suspicious", 2: "Malicious"}
                             label = mapping.get(idx, "Benign")
-                            conf = float(probs_list[idx]) if probs_list else 0.5
+                            conf = float(probs_list[idx]) if probs_list else 0.6
                     else:
                         label, conf = _simple_rule_based_classify(rec)
                 except Exception as ie:
@@ -914,6 +937,352 @@ async def analyze_pcap(
                 shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
+
+@app.post("/scan-file-comprehensive")
+async def scan_file_comprehensive(file: UploadFile = File(...)):
+    """
+    Comprehensive file scan with local model and VirusTotal
+    
+    Args:
+        file: Uploaded file to scan
+        
+    Returns:
+        Combined scan results from local model and VirusTotal
+    """
+    import tempfile
+    import os
+    from utils.virustotal_utils import VirusTotalScanner
+    
+    temp_file_path = None
+    results = {
+        "local_model": {"success": False, "error": None},
+        "virustotal": {"success": False, "error": None}
+    }
+    
+    try:
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # 1. Local Model Scan (Priority)
+        try:
+            logger.info("Starting local model scan...")
+            from models.malware_detector import MalwareDetector, MalwareDetectionRequest
+            
+            # Use the new malware detector
+            detector = MalwareDetector()
+            detection_request = MalwareDetectionRequest(file_path=temp_file_path)
+            result = detector.analyze_file(detection_request)
+            
+            predicted_class = "Malicious" if result.is_malicious else "Benign"
+            confidence_score = result.confidence / 100.0  # Convert percentage to decimal
+            
+            # Use threat level from the detector
+            threat_level = result.threat_level
+            
+            results["local_model"] = {
+                "success": True,
+                "predicted_class": predicted_class,
+                "confidence": float(confidence_score),
+                "threat_level": threat_level,
+                "file_name": file.filename,
+                "file_size": len(content),
+                "model_available": detector.xception_model is not None
+            }
+            logger.info(f"Local model scan completed: {predicted_class} ({confidence_score:.2%})")
+                
+        except Exception as e:
+            results["local_model"]["error"] = str(e)
+            logger.error(f"Local model scan failed: {e}")
+        
+        # 2. VirusTotal Scan (Optional, with async polling)
+        try:
+            logger.info("Starting VirusTotal scan...")
+            scanner = VirusTotalScanner()
+            
+            # Check if API key is available
+            if not scanner.api_key:
+                results["virustotal"]["error"] = "VirusTotal API key not found. Please set Virustotal_API_KEY in .env file."
+                logger.warning("VirusTotal API key not found")
+            else:
+                # Use async polling with proper timeout handling
+                try:
+                    vt_result = await scanner.scan_file_async(temp_file_path, max_wait_time=90, poll_interval=5)
+                    
+                    if vt_result.get("success"):
+                        results["virustotal"] = {
+                            "success": True,
+                            "malicious": vt_result.get("malicious", 0),
+                            "suspicious": vt_result.get("suspicious", 0),
+                            "undetected": vt_result.get("undetected", 0),
+                            "harmless": vt_result.get("harmless", 0)
+                        }
+                        logger.info("VirusTotal scan completed successfully")
+                    else:
+                        results["virustotal"]["error"] = vt_result.get("error", "Unknown VirusTotal error")
+                        logger.warning(f"VirusTotal scan failed: {results['virustotal']['error']}")
+                        
+                except Exception as timeout_error:
+                    # Check if it's a timeout error and provide helpful message
+                    if "timeout" in str(timeout_error).lower():
+                        results["virustotal"]["error"] = "VirusTotal analysis is taking longer than expected. This is normal for larger files or during peak hours. The analysis may still be processing in the background."
+                    else:
+                        results["virustotal"]["error"] = f"VirusTotal scan failed: {str(timeout_error)}"
+                    logger.warning(f"VirusTotal scan failed: {timeout_error}")
+                
+        except Exception as e:
+            results["virustotal"]["error"] = str(e)
+            logger.error(f"VirusTotal scan failed: {e}")
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Comprehensive scan failed: {e}")
+        return {
+            "local_model": {"success": False, "error": str(e)},
+            "virustotal": {"success": False, "error": str(e)}
+        }
+    finally:
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+
+@app.post("/scan-virustotal")
+async def scan_virustotal(file: UploadFile = File(...)):
+    """
+    Scan file with VirusTotal API using asynchronous polling
+    
+    Args:
+        file: Uploaded file to scan
+        
+    Returns:
+        VirusTotal scan results
+    """
+    try:
+        from utils.virustotal_utils import VirusTotalScanner
+        import tempfile
+        import os
+        
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Scan with VirusTotal using async polling
+            scanner = VirusTotalScanner()
+            result = await scanner.scan_file_async(temp_file_path, max_wait_time=90, poll_interval=5)
+            
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "malicious": result.get("malicious", 0),
+                    "suspicious": result.get("suspicious", 0),
+                    "undetected": result.get("undetected", 0),
+                    "harmless": result.get("harmless", 0)
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": result.get("error", "Unknown error")
+                }
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+                
+    except Exception as e:
+        logger.error(f"VirusTotal scan failed: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.post("/scan-file-local")
+async def scan_file_local(file: UploadFile = File(...)):
+    """
+    Local model scan only (fast fallback)
+    
+    Args:
+        file: Uploaded file to scan
+        
+    Returns:
+        Local model scan results only
+    """
+    import tempfile
+    import os
+    from backend.malware_analysis.analyzer import load_model, predect_malware
+    
+    temp_file_path = None
+    try:
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Local Model Scan
+        try:
+            logger.info("Starting local model scan...")
+            model = load_model()
+            
+            # Always try to get a prediction, even if model is None (fallback)
+            predicted_class, confidence_score = predect_malware(temp_file_path, model)
+            
+            # Determine threat level based on confidence and class
+            if confidence_score > 0.9 and predicted_class == "Malicious":
+                threat_level = "High"
+            elif confidence_score > 0.7 and predicted_class == "Malicious":
+                threat_level = "Medium"
+            else:
+                threat_level = "Low"
+            
+            return {
+                "success": True,
+                "predicted_class": predicted_class,
+                "confidence": float(confidence_score),
+                "threat_level": threat_level,
+                "file_name": file.filename,
+                "file_size": len(content),
+                "model_available": model is not None
+            }
+                
+        except Exception as e:
+            logger.error(f"Local model scan failed: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+        
+    except Exception as e:
+        logger.error(f"Local scan failed: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+    finally:
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+
+@app.post("/scan-virustotal-async")
+async def scan_virustotal_async(file: UploadFile = File(...)):
+    """
+    Async VirusTotal scan - starts analysis and returns immediately
+    
+    Args:
+        file: Uploaded file to scan
+        
+    Returns:
+        Analysis ID for later status checking
+    """
+    try:
+        from utils.virustotal_utils import VirusTotalScanner
+        import tempfile
+        import os
+        
+        scanner = VirusTotalScanner()
+        
+        if not scanner.api_key:
+            return {
+                "success": False,
+                "error": "VirusTotal API key not found. Please set Virustotal_API_KEY in .env file."
+            }
+        
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Upload file and get analysis ID
+            upload_result = scanner._upload_file(temp_file_path)
+            
+            if upload_result.get("success"):
+                analysis_id = upload_result.get("analysis_id")
+                return {
+                    "success": True,
+                    "analysis_id": analysis_id,
+                    "message": "File uploaded to VirusTotal. Analysis is processing.",
+                    "status_url": f"/check-virustotal-status/{analysis_id}"
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": upload_result.get("error", "Upload failed")
+                }
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+                
+    except Exception as e:
+        logger.error(f"Async VirusTotal scan failed: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/check-virustotal-status/{analysis_id}")
+async def check_virustotal_status(analysis_id: str):
+    """
+    Check the status of a VirusTotal analysis
+    
+    Args:
+        analysis_id: Analysis ID from async scan
+        
+    Returns:
+        Current analysis status and results if completed
+    """
+    try:
+        from utils.virustotal_utils import VirusTotalScanner
+        
+        scanner = VirusTotalScanner()
+        
+        if not scanner.api_key:
+            return {
+                "success": False,
+                "error": "VirusTotal API key not found"
+            }
+        
+        # Check analysis status
+        url = f"{scanner.base_url}/analyses/{analysis_id}"
+        response = requests.get(url, headers=scanner.headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get("data", {}).get("attributes", {}).get("status")
+            
+            if status == "completed":
+                # Parse the results
+                results = scanner._parse_analysis_data(data)
+                return {
+                    "success": True,
+                    "status": "completed",
+                    "results": results
+                }
+            else:
+                return {
+                    "success": True,
+                    "status": status,
+                    "message": f"Analysis is {status}. Please check again later."
+                }
+        else:
+            return {
+                "success": False,
+                "error": f"Failed to check status: {response.status_code}"
+            }
+            
+    except Exception as e:
+        logger.error(f"Status check failed: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 @app.post("/upload_pcap")

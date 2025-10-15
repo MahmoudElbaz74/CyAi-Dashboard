@@ -5,6 +5,7 @@ Handles input validation and sanitization
 
 import re
 import logging
+import requests
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
@@ -270,3 +271,88 @@ def validate_threat_level(threat_level: str) -> bool:
     """
     valid_levels = ['Low', 'Medium', 'High', 'Critical']
     return threat_level in valid_levels
+
+def preprocess_url(url: str) -> str:
+    """
+    Preprocess URL for phishing detection model.
+    
+    This function:
+    1. Adds www. prefix if not present after protocol
+    2. Resolves shortened URLs (bit.ly, tinyurl, t.co, etc.) to final destination
+    3. Returns normalized URL with www. prefix if short link resolution fails
+    
+    Args:
+        url: URL string to preprocess
+        
+    Returns:
+        Preprocessed URL string
+        
+    Example:
+        >>> preprocess_url("example.com")
+        "https://www.example.com"
+        >>> preprocess_url("bit.ly/abc123")
+        "https://www.final-destination.com"  # if resolution succeeds
+    """
+    try:
+        # Ensure URL is a string and strip whitespace
+        url = str(url).strip()
+        if not url:
+            return ""
+        
+        # Add protocol if missing
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        # Parse the URL to work with components
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # Check if domain already has www prefix
+        if not domain.startswith('www.'):
+            # Reconstruct URL with www prefix
+            new_netloc = 'www.' + domain
+            url = f"{parsed.scheme}://{new_netloc}{parsed.path}{'?' + parsed.query if parsed.query else ''}{'#' + parsed.fragment if parsed.fragment else ''}"
+        
+        # List of common URL shorteners
+        shortener_domains = {
+            'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'short.link', 'is.gd',
+            'v.gd', 'ow.ly', 'buff.ly', 'rebrand.ly', 'shorturl.at', 'tiny.cc',
+            'cutt.ly', 'short.ly', 'adf.ly', 'bit.do', 'shorten.at', 'tiny.one',
+            'shorturl.com', 'tiny.link', 'short.link', 'shorturl.com', 'tiny.cc'
+        }
+        
+        # Check if this is a shortened URL
+        is_shortened = any(shortener in domain for shortener in shortener_domains)
+        
+        if is_shortened:
+            try:
+                # Attempt to resolve the shortened URL
+                response = requests.head(url, allow_redirects=True, timeout=10)
+                final_url = response.url
+                
+                # Parse the final URL and ensure it has www prefix
+                final_parsed = urlparse(final_url)
+                final_domain = final_parsed.netloc.lower()
+                
+                if not final_domain.startswith('www.'):
+                    final_netloc = 'www.' + final_domain
+                    final_url = f"{final_parsed.scheme}://{final_netloc}{final_parsed.path}{'?' + final_parsed.query if final_parsed.query else ''}{'#' + final_parsed.fragment if final_parsed.fragment else ''}"
+                
+                logger.info(f"Successfully resolved shortened URL: {url} -> {final_url}")
+                return final_url
+                
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Failed to resolve shortened URL {url}: {e}")
+                # Return the original URL with www prefix if resolution fails
+                return url
+            except Exception as e:
+                logger.warning(f"Unexpected error resolving URL {url}: {e}")
+                return url
+        else:
+            # Not a shortened URL, return with www prefix
+            return url
+            
+    except Exception as e:
+        logger.error(f"Error preprocessing URL {url}: {e}")
+        # Return the original URL as fallback
+        return str(url) if url else ""

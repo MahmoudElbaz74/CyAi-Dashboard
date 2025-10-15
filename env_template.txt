@@ -4,6 +4,9 @@
 # Gemini API Configuration
 GEMINI_API_KEY=your_gemini_api_key_here
 
+# VirusTotal API Configuration
+Virustotal_API_KEY=your_virustotal_api_key_here
+
 # Backend Configuration
 BACKEND_HOST=0.0.0.0
 BACKEND_PORT=8000

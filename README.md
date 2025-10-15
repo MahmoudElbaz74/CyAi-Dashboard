@@ -2,6 +2,25 @@
 
 AI-powered cybersecurity analysis platform providing log analysis, URL phishing detection, malware file scanning, and an AI assistant augmented by Gemini-1.5-Pro. The system includes a FastAPI backend with pre-trained model modules and a Streamlit frontend.
 
+## Recent Updates
+
+### Async VirusTotal Integration
+- Implemented asynchronous polling for VirusTotal API using `httpx`
+- Polls every 5 seconds until analysis completion or 90-second timeout
+- Non-blocking FastAPI endpoints with proper timeout handling
+- Connectivity test before scanning with clear error messages
+- Startup log confirms VirusTotal API reachability
+
+### Improved Model Confidence Scoring
+- Fixed static 50% confidence in local model scan
+- Dynamic confidence computation based on model outputs and file characteristics
+- Realistic confidence values that vary per file analysis
+- Better fallback confidence calculation for heuristic detection
+
+### New Dependencies
+- Added `httpx>=0.24.0` for asynchronous HTTP requests (replaces aiohttp)
+- Updated requirements.txt with all required packages
+
 ## Contents
 - Overview
 - Architecture
@@ -152,7 +171,8 @@ The URL checker uses a professional, explainable, multi-stage pipeline:
   - Produces a model label (Safe/Suspicious/Malicious) and a concise reasoning string
 
 - Stage 2 — VirusTotal Reputation:
-  - Submits the URL to VirusTotal with safe timeouts and error handling
+  - Submits the URL to VirusTotal using asynchronous polling
+  - Polls every 5 seconds until analysis completion or 90-second timeout
   - Parses detections and summarizes a `verdict` and stats for display
 
 - Stage 3 — Gemini Final Verdict:
@@ -238,11 +258,14 @@ streamlit run main.py
 ## Configuration and Environment
 - `backend/config.py` reads environment variables:
   - `GEMINI_API_KEY`: Required for Gemini explanations
+  - `VIRUSTOTAL_API_KEY`: Required for VirusTotal file scanning (optional)
   - `BACKEND_HOST`, `BACKEND_PORT`: FastAPI bind address/port
   - `DEBUG`, `LOG_LEVEL`: Logging/diagnostics
   - `MAX_FILE_SIZE`: e.g., 50MB; `Config.get_file_size_bytes()` helper
   - `CORS_ORIGINS`: CSV list for CORS
 - Missing `GEMINI_API_KEY` logs a warning; explanations fall back to defaults.
+- Missing `VIRUSTOTAL_API_KEY` disables VirusTotal scanning; local model analysis still works.
+- Backend connects directly to https://www.virustotal.com/api/v3/ for file analysis.
 
 ## API Endpoints and Examples
 
